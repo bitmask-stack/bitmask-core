@@ -1,5 +1,5 @@
 #!/bin/sh
-wasm-pack build --release --target web --features segwit
+wasm-pack build --release --target web
 cp pkg/*.ts lib/web
 cp pkg/*.js lib/web
 cp pkg/*.wasm lib/web

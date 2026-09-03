@@ -11,11 +11,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
+          toolchain: 1.98.0
           targets: x86_64-unknown-linux-gnu
           components: rustfmt
 
@@ -28,11 +28,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
+          toolchain: 1.98.0
           targets: x86_64-unknown-linux-gnu
           components: clippy
 
@@ -51,11 +51,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
+          toolchain: 1.98.0
           targets: wasm32-unknown-unknown
           components: clippy
 
@@ -79,11 +79,11 @@ jobs:
     needs: lint
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
+          toolchain: 1.98.0
           targets: x86_64-unknown-linux-gnu
           components: clippy, rustfmt
 
@@ -127,11 +127,11 @@ jobs:
     needs: lint-wasm
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
+          toolchain: 1.98.0
           targets: wasm32-unknown-unknown
 
       # - uses: Swatinem/rust-cache@v2

@@ -1,80 +1,91 @@
-#![allow(deprecated)]
-use amplify::{
-    confinement::{Confined, U32},
-    hex::{FromHex, ToHex},
-    Array, ByteArray, Bytes32,
+#![allow(clippy::result_large_err)] // SwapErrors is the RGB 0.11 product Result; do not reshape
+use crate::bp::models::BtcAccount;
+use crate::debug;
+use crate::rgb::compat::TentativeWitness;
+use crate::rgb::constants::LIB_NAME_BITMASK;
+use crate::rgb::data::RGBStock;
+use crate::rgb::ext::{PsbtExt, PsbtOrderInExt, ShardErrors};
+use crate::rgb::models::{
+    AssetKit, AssetType, BidAsset, ContractKit, CounterParty, PublicRgbBid, PublicRgbOffer,
+    RgbAccount, RgbBid, RgbOffer, UtxoKit,
 };
-use autosurgeon::{reconcile, Hydrate, Reconcile};
-use baid58::{Baid58ParseError, FromBaid58, ToBaid58};
-use bitcoin::psbt::Psbt as PsbtV0;
-use bitcoin_30::secp256k1::{ecdh::SharedSecret, PublicKey, Secp256k1, SecretKey};
-use bitcoin_scripts::address::AddressCompat;
-use bp::Txid;
-use core::fmt::Display;
-use garde::Validate;
-
-use rgbstd::{
-    containers::{Bindle, Transfer},
-    validation::{AnchoredBundle, ConsignmentApi},
+use crate::rgb::prefetch::BitmaskResolver;
+use crate::rgb::transfer::{RgbInvoiceOptions, create_rgb_invoice};
+use crate::structs::{
+    ChainFee, RgbInvoiceRequest, RgbInvoiceValue, RgbSelection, SecretString, UDAValue,
 };
+use crate::wallet::data::CrossStoreError;
+use amplify::confinement::{Confined, U16};
+use amplify::hex::FromHex;
+use armor::AsciiArmor;
+use autosurgeon::{Hydrate, Reconcile};
+use bpstd::psbt::ConstructionError;
+use bpstd::{
+    Address, NormalIndex, Outpoint, Prevout, Psbt, PsbtVer, Sats, SeqNo, Tx, TxIn, TxOut, Vout,
+};
+use bpwallet::psbt::PsbtConstructor;
+use bpwallet::{Keychain, SighashType, Terminal};
+use dbc::Method;
+use dbc::Method::TapretFirst;
+use nonasync::persistence::CloneNoPersistence;
+use psrgbt::{EmbedError, RgbOutExt, RgbPsbtExt};
+use rgb::containers::SealWitness;
+use rgb::persistence::{IndexReadProvider, StashReadProvider};
+use rgb::{CompletionError, TransitionBundle};
+use rgbcore::SecretSeal;
+use rgbcore::seals::txout::CloseMethod;
+use rgbcore::{ChainNet, ContractId, GraphSeal, Layer1, Opout, OutputSeal};
+use rgbinvoice::{Beneficiary, RgbInvoice};
+use rgbstd::containers::{ConsignmentId, Contract};
+use rgbstd::contract::{AllocatedState, BuilderError, ContractError};
 use serde::{Deserialize, Serialize};
-use std::{
-    cmp,
-    collections::{btree_map, BTreeMap},
-    fmt::{self, Formatter},
-    str::FromStr,
-};
-use strict_encoding::{
-    StrictDecode, StrictDeserialize, StrictDumb, StrictEncode, StrictSerialize, StrictType,
-};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::str::FromStr;
+use strict_encoding::{DefaultBasedStrictDumb, StrictDeserialize, StrictDumb, StrictSerialize};
+use strict_types::{StrictDecode, StrictEncode, StrictType};
 
-use crate::{
-    rgb::{
-        constants::LIB_NAME_BITMASK,
-        crdt::{LocalRgbAuctions, LocalRgbOfferBid, LocalRgbOffers},
-        fs::{
-            retrieve_auctions_offers, retrieve_public_offers, retrieve_swap_offer_bid,
-            store_auction_offers, store_public_offers, store_swap_bids, RgbPersistenceError,
-        },
-    },
-    structs::PsbtFeeRequest,
-};
-use crate::{structs::AllocationDetail, validators::RGBContext};
-
-type AssetId = String;
-type OfferId = String;
-type BidId = String;
-type TransferId = String;
-
-#[derive(
-    Eq,
-    Ord,
-    PartialEq,
-    PartialOrd,
-    Serialize,
-    Deserialize,
-    Reconcile,
-    Hydrate,
-    Clone,
-    Debug,
-    Display,
-    Default,
-)]
-pub enum RgbOrderStatus {
-    #[default]
-    #[display(inner)]
-    #[serde(rename = "open")]
-    Open,
-    #[serde(rename = "fill")]
-    Fill,
+#[derive(Clone, Eq, PartialEq, Debug, Display, Error, From)]
+#[display(doc_comments)]
+pub enum OrderSupplError {
+    /// there is no contract {0}
+    NoContract(String),
+    /// there is no contract anchored at this outpoint
+    NoContractOutpoint,
+    /// Swap can only be carried out with a fixed fee
+    NoSupportFee,
+    /// Swap can only be with utxo, not address.
+    NoUtxo,
+    /// wrong counterparty order
+    WrongCounterParty,
+    /// wrong psbt input. Invalid {0} prevout
+    WrongInput(String),
+    /// wrong psbt output. Invalid {0} txout
+    WrongOutput(String),
+    /// wrong change output. invalid {0} terminal
+    WrongChange(String),
+    /// wrong address output. {0}
+    WrongAddress(String),
+    /// blank assignment fail. {0}
+    WrongAssign(String),
+    /// blank transitions fail. {0}
+    WrongBlank(String),
+    /// rgb batch construction fail. {0}
+    WrongBatch(String),
+    /// cannot be creating beneficiary. {0}
+    WrongBeneficiary(String),
+    /// cannot be access rgb_stock history. {0}
+    StockError(String),
+    Builder(BuilderError),
+    /// cannot be constructing psbt. {0}
+    Psbt(String),
 }
 
 #[derive(
-    Clone, Eq, PartialEq, Serialize, Deserialize, Debug, Default, Reconcile, Hydrate, Display,
+    Clone, Eq, PartialEq, Hash, Serialize, Deserialize, Debug, Default, Reconcile, Hydrate, Display,
 )]
 #[serde(rename_all = "camelCase")]
 #[display(inner)]
-pub enum RgbSwapStrategy {
+pub enum RgbSwap {
     #[default]
     #[serde(rename = "auction")]
     Auction,
@@ -86,1417 +97,1880 @@ pub enum RgbSwapStrategy {
     Airdrop,
 }
 
-#[derive(
-    Clone, Eq, PartialEq, Serialize, Deserialize, Debug, Default, Reconcile, Hydrate, Display,
-)]
-#[serde(rename_all = "camelCase")]
-#[display(inner)]
-pub enum RgbAuctionStrategy {
-    #[default]
-    #[serde(rename = "auction")]
-    Auction,
-    #[serde(rename = "airdrop")]
-    Airdrop { max_claim: String },
-}
-
-#[derive(Clone, Debug, Display, Default, Error)]
-#[display(doc_comments)]
-pub struct RgbOfferOptions {
+#[derive(Clone)]
+/// Options used in swap asset operation
+pub struct OfferOptions {
+    /// Feature-flag to enable sign offer psbt
+    pub sign: bool,
+    /// Feature-flag to enable send data to proxy server
+    pub proxy: bool,
+    /// Feature-flag to enable marketplace fee
+    pub marketplace_fee: bool,
+    /// Define layer1 chain
+    pub layer: Layer1,
+    /// Define close method
+    pub close_method: Method,
+    /// Private key(s) for PSBT signing (flag sign=true)
+    pub private_keys: Vec<SecretString>,
+    /// Optional airdrop fee (strategy=airdrop)
+    pub airdrop_fee: Option<u64>,
+    /// Optional auctions collection ID (strategy= auction | airdrop)
     pub bundle_id: Option<String>,
-    pub max_claim: Option<u64>,
-    pub fee_airdrop: Option<PsbtFeeRequest>,
 }
 
-impl RgbOfferOptions {
-    pub fn new(secret: String) -> Self {
-        let secp = Secp256k1::new();
-        let secret = hex::decode(secret).expect("cannot decode hex sk in new RgbOffer");
-        let secret_key = SecretKey::from_slice(&secret).expect("error parsing sk in new RgbOffer");
-        let public_key = PublicKey::from_secret_key(&secp, &secret_key);
-        let bundle_id = Some(public_key.to_hex());
+impl Default for OfferOptions {
+    fn default() -> Self {
         Self {
-            bundle_id,
-            fee_airdrop: None,
-            max_claim: None,
-        }
-    }
-
-    pub fn new_airdrop(secret: String, fee: PsbtFeeRequest, max: u64) -> Self {
-        let secp = Secp256k1::new();
-        let secret = hex::decode(secret).expect("cannot decode hex sk in new RgbOffer");
-        let secret_key = SecretKey::from_slice(&secret).expect("error parsing sk in new RgbOffer");
-        let public_key = PublicKey::from_secret_key(&secp, &secret_key);
-        let bundle_id = Some(public_key.to_hex());
-        Self {
-            bundle_id,
-            fee_airdrop: Some(fee),
-            max_claim: Some(max),
+            sign: false,
+            proxy: true,
+            marketplace_fee: true,
+            layer: Layer1::Bitcoin,
+            close_method: TapretFirst,
+            bundle_id: None,
+            private_keys: vec![],
+            airdrop_fee: None,
         }
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, Validate, Reconcile, Hydrate, Debug, Display, Default)]
-#[garde(context(RGBContext))]
-#[display("{offer_id} / {contract_id}:{asset_amount} / {bitcoin_price}")]
-pub struct RgbOffer {
-    #[garde(ascii)]
-    #[garde(length(min = 0, max = 100))]
-    pub offer_id: OfferId,
-    #[garde(skip)]
-    pub status: RgbOrderStatus,
-    #[garde(ascii)]
-    pub contract_id: AssetId,
-    #[garde(ascii)]
-    pub iface: String,
-    #[garde(skip)]
-    pub strategy: RgbSwapStrategy,
-    #[garde(ascii)]
-    pub pub_key: String,
-    #[garde(ascii)]
-    pub terminal: String,
-    #[garde(range(min = u64::MIN, max = u64::MAX))]
-    pub asset_amount: u64,
-    #[garde(range(min = u8::MIN, max = u8::MAX))]
-    pub asset_precision: u8,
-    #[garde(range(min = u64::MIN, max = u64::MAX))]
-    pub bitcoin_price: u64,
-    #[garde(ascii)]
-    pub seller_address: String,
-    #[garde(ascii)]
-    pub seller_psbt: String,
-    #[garde(skip)]
-    pub expire_at: Option<i64>,
-    #[garde(skip)]
-    pub bundle_id: Option<String>,
-    #[garde(skip)]
-    pub max_claim: Option<u64>,
-    #[garde(skip)]
-    pub transfer_id: Option<String>,
+impl OfferOptions {
+    pub fn p2p(secrets: Vec<SecretString>) -> Self {
+        Self {
+            sign: true,
+            proxy: true,
+            marketplace_fee: true,
+            layer: Layer1::Bitcoin,
+            close_method: TapretFirst,
+            bundle_id: None,
+            private_keys: secrets,
+            airdrop_fee: None,
+        }
+    }
+}
+
+#[derive(Clone)]
+/// Options used in swap asset operation
+pub struct BidOptions {
+    /// Feature-flag to enable sign offer psbt
+    pub sign: bool,
+    /// Feature-flag to enable send data to proxy server
+    pub proxy: bool,
+    /// Define layer1 chain
+    pub layer: Layer1,
+    /// Define close method
+    pub close_method: Method,
+    /// Private key(s) for PSBT signing (flag sign=true)
+    pub private_keys: Vec<SecretString>,
+    /// Optional offer entire data (pure p2p swap)
+    pub offer: Option<PublicRgbOffer>,
+}
+
+impl Default for BidOptions {
+    fn default() -> Self {
+        Self {
+            sign: false,
+            proxy: true,
+            layer: Layer1::Bitcoin,
+            close_method: TapretFirst,
+            private_keys: vec![],
+            offer: None,
+        }
+    }
+}
+
+impl BidOptions {
+    pub fn p2p(secrets: Vec<SecretString>) -> Self {
+        Self {
+            sign: true,
+            proxy: true,
+            layer: Layer1::Bitcoin,
+            close_method: TapretFirst,
+            private_keys: secrets,
+            offer: None,
+        }
+    }
+
+    pub fn debug(secrets: Vec<SecretString>, offer: PublicRgbOffer) -> Self {
+        Self {
+            sign: true,
+            proxy: true,
+            layer: Layer1::Bitcoin,
+            close_method: TapretFirst,
+            private_keys: secrets,
+            offer: Some(offer),
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, StrictType, StrictEncode, StrictDecode, Debug, Default)]
+#[strict_type(lib = LIB_NAME_BITMASK)]
+pub struct RgbExtraShards {
+    pub extras: Confined<Vec<RgbExtraShard>, 0, { U16 - 1 }>,
+}
+
+impl StrictSerialize for RgbExtraShards {}
+impl StrictDeserialize for RgbExtraShards {}
+impl DefaultBasedStrictDumb for RgbExtraShards {}
+
+#[derive(Clone, Serialize, Deserialize, StrictType, StrictEncode, StrictDecode, Debug)]
+#[strict_type(lib = LIB_NAME_BITMASK)]
+pub struct RgbExtraShard {
+    pub contract_id: ContractId,
+    #[serde(with = "crate::rgb::compat::contract_serde")]
+    pub contract: Contract,
+    pub inputs: Confined<BTreeMap<Opout, AllocatedState>, 0, { U16 - 1 }>,
+    pub anchors: Confined<BTreeMap<rgbcore::Txid, AnchorShard>, 0, { U16 - 1 }>,
+}
+
+impl StrictSerialize for RgbExtraShard {}
+impl StrictDeserialize for RgbExtraShard {}
+impl DefaultBasedStrictDumb for RgbExtraShard {}
+
+impl Default for RgbExtraShard {
+    fn default() -> Self {
+        Self {
+            contract_id: ContractId::strict_dumb(),
+            contract: Contract::strict_dumb(),
+            inputs: Confined::new(),
+            anchors: Confined::new(),
+        }
+    }
+}
+
+impl RgbExtraShard {
+    fn new(
+        contract_id: ContractId,
+        contract: Contract,
+        inputs: BTreeMap<Opout, AllocatedState>,
+        anchors: BTreeMap<rgbcore::Txid, AnchorShard>,
+    ) -> Self {
+        Self {
+            contract_id,
+            contract,
+            inputs: Confined::from_checked(inputs),
+            anchors: Confined::from_checked(anchors),
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, StrictType, StrictEncode, StrictDecode, Debug)]
+#[strict_type(lib = LIB_NAME_BITMASK)]
+pub struct RgbShard {
+    pub inputs: Confined<BTreeMap<Opout, AllocatedState>, 0, { U16 - 1 }>,
+    pub anchors: Confined<BTreeMap<rgbcore::Txid, AnchorShard>, 0, { U16 - 1 }>,
+}
+
+impl StrictSerialize for RgbShard {}
+impl StrictDeserialize for RgbShard {}
+impl DefaultBasedStrictDumb for RgbShard {}
+
+impl Default for RgbShard {
+    fn default() -> Self {
+        Self {
+            inputs: Confined::new(),
+            anchors: Confined::new(),
+        }
+    }
+}
+
+impl RgbShard {
+    fn new(
+        inputs: BTreeMap<Opout, AllocatedState>,
+        anchors: BTreeMap<rgbcore::Txid, AnchorShard>,
+    ) -> Self {
+        Self {
+            inputs: Confined::from_checked(inputs),
+            anchors: Confined::from_checked(anchors),
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, StrictType, StrictEncode, StrictDecode, Debug)]
+#[strict_type(lib = LIB_NAME_BITMASK)]
+pub struct AnchorShard {
+    pub witness_seal: SealWitness,
+    pub bundle: TransitionBundle,
+}
+
+impl Default for AnchorShard {
+    fn default() -> Self {
+        Self {
+            witness_seal: SealWitness::strict_dumb(),
+            bundle: TransitionBundle::strict_dumb(),
+        }
+    }
+}
+
+impl AnchorShard {
+    fn new(witness_seal: SealWitness, bundle: TransitionBundle) -> Self {
+        Self {
+            witness_seal,
+            bundle,
+        }
+    }
+}
+
+// Persisted tapret host selection for seller side
+#[derive(Clone, Serialize, Deserialize, Debug, Default)]
+pub struct HostTerminal {
+    pub keychain: Keychain,
+    pub index: NormalIndex,
+}
+
+impl StrictSerialize for AnchorShard {}
+impl StrictDeserialize for AnchorShard {}
+impl DefaultBasedStrictDumb for AnchorShard {}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Default)]
+pub struct OrderSuppl {
+    pub psbt: String,
+    pub shard: Option<String>,
+    pub beneficiary: Option<String>,
+    pub extra: Option<String>,
+    // Persisted seller host terminal (keychain,index) to locate tapret host post-merge
+    pub seller_host_terminal: Option<HostTerminal>,
+    // Strong host binding: seller's host output scriptPubKey (hex) that MUST be preserved post-merge
+    pub seller_host_spk: Option<String>,
+}
+
+impl OrderSuppl {
+    pub fn l1(psbt: Psbt) -> Self {
+        Self {
+            psbt: psbt.to_base64_ver(PsbtVer::V0),
+            shard: None,
+            extra: None,
+            beneficiary: None,
+            seller_host_terminal: None,
+            seller_host_spk: None,
+        }
+    }
+
+    pub fn rgb(
+        inputs: BTreeMap<Opout, AllocatedState>,
+        anchors: BTreeMap<rgbcore::Txid, AnchorShard>,
+        extra: Vec<RgbExtraShard>,
+        psbt: Psbt,
+    ) -> Self {
+        let strict_shard = RgbShard::new(inputs, anchors)
+            .to_strict_serialized::<U16>()
+            .unwrap()
+            .to_ascii_armored_string();
+
+        let extra = if !extra.is_empty() {
+            let extras: Confined<Vec<RgbExtraShard>, 0, { U16 - 1 }> =
+                Confined::from_slice_checked(extra.as_slice());
+            let extra_shards = RgbExtraShards { extras };
+            let strict_shard = extra_shards
+                .to_strict_serialized::<U16>()
+                .unwrap()
+                .to_ascii_armored_string();
+            Some(strict_shard)
+        } else {
+            none!()
+        };
+
+        Self {
+            psbt: psbt.to_base64_ver(PsbtVer::V0),
+            shard: Some(strict_shard),
+            extra,
+            beneficiary: None,
+            seller_host_terminal: None,
+            seller_host_spk: None,
+        }
+    }
+
+    pub fn add_invoice(&mut self, invoice: RgbInvoice) {
+        self.beneficiary = Some(invoice.to_string());
+    }
+
+    pub fn add_seal(&mut self, seal: SecretSeal) {
+        self.beneficiary = Some(seal.to_string());
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct SwapSupplement {
+    pub tapret: String,
+    pub psbt: String,
+    pub transfers: BTreeMap<ConsignmentId, String>,
+    #[serde(default)]
+    pub extras_anchors: BTreeMap<ContractId, BTreeMap<rgbcore::Txid, AnchorShard>>,
+    #[serde(default)]
+    pub fascia: Option<String>, // Serialized fascia for extras anchor consumption
 }
 
 impl RgbOffer {
-    pub fn is_fill(self) -> bool {
-        self.status == RgbOrderStatus::Fill
-    }
+    pub(crate) fn create_suppl(
+        &mut self,
+        prev_allocatinos: Vec<Outpoint>,
+        btc_account: &mut BtcAccount,
+        rgb_account: &mut RgbAccount,
+        rgb_stock: &mut RGBStock,
+    ) -> Result<OrderSuppl, OrderSupplError> {
+        let contract_id = self.contract_id();
+        let seqno = SeqNo::from_consensus_u32(0);
 
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        secret: String,
-        contract_id: String,
-        iface: String,
-        allocations: Vec<AllocationDetail>,
-        asset_amount: u64,
-        asset_precision: u8,
-        seller_address: AddressCompat,
-        bitcoin_price: u64,
-        psbt: String,
-        terminal: String,
-        strategy: RgbSwapStrategy,
-        expire_at: Option<i64>,
-        bundle_id: Option<String>,
-        max_claim: Option<u64>,
-    ) -> Self {
-        let secp = Secp256k1::new();
-        let secret = hex::decode(secret).expect("cannot decode hex sk in new RgbOffer");
-        let secret_key = SecretKey::from_slice(&secret).expect("error parsing sk in new RgbOffer");
-        let pub_key = PublicKey::from_secret_key(&secp, &secret_key).to_hex();
+        // :: Create PSBT ::
+        let mut psbt = Psbt::create(PsbtVer::V2);
+        let change_vout = Vout::from_u32(0);
 
-        let mut asset_utxos: Vec<String> = allocations.into_iter().map(|a| a.utxo).collect();
-        asset_utxos.sort();
+        // Inputs
+        let inputs = self.asset().inputs();
+        for input in inputs.clone() {
+            let UtxoKit {
+                outpoint, value, ..
+            } = input.clone();
+            let prev_out =
+                Prevout::new(crate::rgb::compat::outpoint_bitcoin_to_bp(outpoint), value);
 
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(contract_id.as_bytes());
-        for asset_utxo in asset_utxos {
-            hasher.update(asset_utxo.as_bytes());
+            if let Some((_, spk)) = rgb_account
+                .wallet
+                .utxo(crate::rgb::compat::outpoint_bitcoin_to_bp(input.outpoint))
+            {
+                let new_psbt_input = psbt
+                    .construct_input(
+                        prev_out,
+                        rgb_account.wallet.descriptor(),
+                        input.terminal,
+                        spk,
+                        seqno,
+                    )
+                    .map_err(|_| OrderSupplError::WrongInput(format!("{outpoint}#{value}")))?;
+                new_psbt_input.sighash_type = Some(SighashType::none_anyone_can_pay())
+            }
         }
 
-        let id = Array::from_array(hasher.finalize().into());
-        let order_id = OrderId(id);
-        let order_id = order_id.to_baid58_string();
-
-        RgbOffer {
-            offer_id: order_id.to_string(),
-            status: RgbOrderStatus::Open,
-            contract_id,
-            iface,
-            asset_amount,
-            asset_precision,
-            bitcoin_price,
-            seller_psbt: psbt,
-            seller_address: seller_address.to_string(),
-            pub_key,
-            expire_at,
-            terminal,
-            strategy,
-            bundle_id,
-            max_claim,
-            ..Default::default()
+        // Debug: planned offer inputs and total value
+        {
+            let planned_inputs_dbg: Vec<String> = inputs
+                .iter()
+                .map(|x| format!("{}@{}", x.outpoint, x.value))
+                .collect();
+            let total_sats: Sats = inputs.iter().map(|x| x.value).sum();
+            debug!(format!(
+                "offer.create_suppl planned_inputs={} total_sats={}",
+                planned_inputs_dbg.join(","),
+                total_sats
+            ));
         }
-    }
-}
 
-#[derive(Clone, Serialize, Deserialize, Validate, Reconcile, Hydrate, Debug, Display, Default)]
-#[garde(context(RGBContext))]
-#[display("{offer_id} / {contract_id}:{asset_amount} / {bitcoin_price}")]
-pub struct RgbOfferSwap {
-    #[garde(ascii)]
-    #[garde(length(min = 0, max = 100))]
-    pub offer_id: OfferId,
-    #[garde(ascii)]
-    pub contract_id: AssetId,
-    #[garde(ascii)]
-    pub iface: String,
-    #[garde(range(min = u64::MIN, max = u64::MAX))]
-    pub asset_amount: u64,
-    #[garde(range(min = u8::MIN, max = u8::MAX))]
-    pub asset_precision: u8,
-    #[garde(range(min = u64::MIN, max = u64::MAX))]
-    pub bitcoin_price: u64,
-    #[garde(ascii)]
-    pub seller_address: String,
-    #[garde(skip)]
-    pub strategy: RgbSwapStrategy,
-    #[garde(ascii)]
-    pub pub_key: String,
-    #[garde(ascii)]
-    pub seller_psbt: Option<String>,
-    #[garde(skip)]
-    pub bundle_id: Option<String>,
-    #[garde(skip)]
-    pub max_claim: Option<u64>,
-    #[garde(skip)]
-    pub expire_at: Option<i64>,
-}
-
-impl From<RgbOffer> for RgbOfferSwap {
-    fn from(value: RgbOffer) -> Self {
-        let RgbOffer {
-            offer_id,
-            contract_id,
-            iface,
-            asset_amount,
-            bitcoin_price,
-            seller_psbt,
-            seller_address,
-            pub_key,
-            asset_precision,
-            strategy,
-            expire_at,
-            bundle_id,
-            max_claim,
-            ..
-        } = value;
-
-        let seller_psbt = if seller_psbt.is_empty() {
-            None
+        // (Change) Output host selection:
+        // Prefer a keychain that preserves ownership of "extras".
+        // If any extra contracts on these inputs are RGB20, pick RGB20 keychain; otherwise use offered family.
+        let input_outs: Vec<_> = inputs.iter().map(|u| u.outpoint).collect();
+        let mut prefer_rgb20 = false;
+        if let Ok(it) = rgb_stock.contracts_assigning(input_outs.clone()) {
+            for id in it {
+                if id == contract_id {
+                    continue;
+                }
+                if let Ok(contract) = rgb_stock.export_contract(id) {
+                    // Determine family from schema instead of relying on a missing iface field
+                    let contract_type = AssetType::from_schema(contract.schema.schema_id());
+                    if matches!(contract_type, Some(AssetType::RGB20)) {
+                        prefer_rgb20 = true;
+                        break;
+                    }
+                }
+            }
+        }
+        let asset_keychain = if prefer_rgb20 {
+            AssetType::RGB20.to_keychain()
         } else {
-            Some(seller_psbt)
+            self.ty().to_keychain()
         };
+        let change_index = rgb_account
+            .wallet
+            .next_derivation_index(asset_keychain, true);
+        let change_terminal = Terminal::new(asset_keychain, change_index);
 
-        Self {
-            offer_id,
-            strategy,
-            contract_id,
-            iface,
-            asset_amount,
-            asset_precision,
-            bitcoin_price,
-            seller_psbt,
-            seller_address,
-            pub_key,
-            bundle_id,
-            expire_at,
-            max_claim,
-        }
-    }
-}
+        // Debug: chosen seller host terminal (possibly adjusted to protect extras)
+        debug!(format!(
+            "offer.create_suppl host_terminal keychain={:?} index={:?}",
+            asset_keychain, change_index
+        ));
 
-#[derive(Clone, Serialize, Deserialize, Validate, Reconcile, Hydrate, Debug, Default, Display)]
-#[garde(context(RGBContext))]
-#[display("{bid_id} / {contract_id}:{asset_amount} / {bitcoin_amount}")]
-pub struct RgbBid {
-    #[garde(ascii)]
-    #[garde(length(min = 0, max = 100))]
-    pub bid_id: BidId,
-    #[garde(skip)]
-    pub status: RgbOrderStatus,
-    #[garde(ascii)]
-    #[garde(length(min = 0, max = 100))]
-    pub offer_id: OfferId,
-    #[garde(ascii)]
-    pub pub_key: String,
-    #[garde(skip)]
-    pub contract_id: AssetId,
-    #[garde(skip)]
-    pub iface: String,
-    #[garde(range(min = u64::MIN, max = u64::MAX))]
-    pub asset_amount: u64,
-    #[garde(range(min = u8::MIN, max = u8::MAX))]
-    pub asset_precision: u8,
-    #[garde(range(min = u64::MIN, max = u64::MAX))]
-    pub bitcoin_amount: u64,
-    #[garde(ascii)]
-    pub buyer_invoice: String,
-    #[garde(ascii)]
-    pub buyer_psbt: Option<String>,
-    #[garde(skip)]
-    pub transfer_id: Option<String>,
-    #[garde(skip)]
-    pub transfer: Option<String>,
-    #[garde(skip)]
-    pub swap_psbt: Option<String>,
-}
+        let change_amount: Sats = inputs.clone().into_iter().map(|x| x.value).sum();
 
-impl RgbBid {
-    pub fn is_fill(self) -> bool {
-        self.status == RgbOrderStatus::Fill
-    }
+        psbt.construct_change(
+            rgb_account.wallet.descriptor(),
+            change_terminal,
+            change_amount,
+        )
+        .map_err(|_| OrderSupplError::WrongChange(format!("{change_terminal}")))?;
 
-    pub(crate) fn new(
-        secret: String,
-        offer_id: OfferId,
-        contract_id: AssetId,
-        asset_amount: u64,
-        asset_precision: u8,
-        bitcoin_price: u64,
-        bitcoin_utxos: Vec<String>,
-    ) -> Self {
-        let secp = Secp256k1::new();
-        let secret = hex::decode(secret).expect("cannot decode hex sk in new RgbBid");
-        let secret_key = SecretKey::from_slice(&secret).expect("error parsing sk in new RgbBid");
-        let pub_key = PublicKey::from_secret_key(&secp, &secret_key).to_hex();
+        // (Offer) Output
+        let bitcoin_keychain = AssetType::Bitcoin.to_keychain();
+        let offer_index = btc_account.wallet.last_derivation_index(bitcoin_keychain);
+        let offer_terminal = Terminal::new(bitcoin_keychain, offer_index);
+        let offer_address = btc_account.wallet.next_address(bitcoin_keychain, false);
 
-        let mut allocations = bitcoin_utxos;
-        allocations.sort();
-
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(contract_id.as_bytes());
-        for allocation in allocations {
-            hasher.update(allocation.as_bytes());
+        if let CounterParty::Sats(offer_value) = self.counter_party() {
+            let offer_value = Sats::from(*offer_value);
+            psbt.construct_output(offer_address.script_pubkey(), offer_value)
+                .map_err(|_| OrderSupplError::WrongChange(format!("{offer_terminal}")))?;
         }
 
-        let id = Array::from_array(hasher.finalize().into());
-        let order_id = OrderId(id);
-        let order_id = order_id.to_baid58_string();
+        // :: Contract Shard ::
+        let prev_outputs = psbt
+            .to_unsigned_tx()
+            .inputs
+            .iter()
+            .map(|txin| txin.prev_output)
+            .collect::<HashSet<Outpoint>>();
 
-        RgbBid {
-            bid_id: order_id.to_string(),
-            status: RgbOrderStatus::Open,
-            offer_id,
-            contract_id,
-            asset_amount,
-            asset_precision,
-            bitcoin_amount: bitcoin_price,
-            pub_key,
-            ..Default::default()
+        let mut asset_available_amt = 0;
+
+        // Prepare main transition
+        let mut allocation = bmap! {};
+        let mut contract_inputs = BTreeMap::new();
+
+        for (output_seal, opout_state_map) in rgb_stock
+            .contract_assignments_for(
+                contract_id,
+                prev_outputs
+                    .iter()
+                    .filter(|op| {
+                        inputs
+                            .iter()
+                            .any(|x| crate::rgb::compat::outpoint_bitcoin_to_bp(x.outpoint) == **op)
+                    })
+                    .copied()
+                    .map(crate::rgb::compat::outpoint_bp_to_bitcoin),
+            )
+            .map_err(|_| OrderSupplError::NoContractOutpoint)?
+        {
+            for (opout, state) in opout_state_map {
+                if let AllocatedState::Amount(amt) = &state {
+                    asset_available_amt += amt.as_u64();
+                }
+
+                allocation.insert(output_seal.to_outpoint(), contract_id);
+                contract_inputs.insert(opout, state.clone());
+            }
         }
-    }
-}
 
-#[derive(Clone, Serialize, Deserialize, Validate, Reconcile, Hydrate, Debug, Default, Display)]
-#[garde(context(RGBContext))]
-#[display("{bid_id} / {contract_id}:{asset_amount} / {bitcoin_amount}")]
-pub struct RgbBidSwap {
-    #[garde(ascii)]
-    #[garde(length(min = 0, max = 100))]
-    pub bid_id: BidId,
-    #[garde(ascii)]
-    #[garde(length(min = 0, max = 100))]
-    pub offer_id: OfferId,
-    #[garde(ascii)]
-    pub pub_key: String,
-    #[garde(ascii)]
-    #[garde(length(min = 0, max = 100))]
-    pub iface: String,
-    #[garde(skip)]
-    pub contract_id: AssetId,
-    #[garde(range(min = u64::MIN, max = u64::MAX))]
-    pub asset_amount: u64,
-    #[garde(range(min = u8::MIN, max = u8::MAX))]
-    pub asset_precision: u8,
-    #[garde(range(min = u64::MIN, max = u64::MAX))]
-    pub bitcoin_amount: u64,
-    #[garde(ascii)]
-    pub buyer_invoice: String,
-    #[garde(skip)]
-    pub buyer_psbt: Option<String>,
-    #[garde(skip)]
-    pub transfer_id: Option<String>,
-    #[garde(skip)]
-    pub transfer: Option<String>,
-    #[garde(skip)]
-    pub swap_psbt: Option<String>,
-    #[garde(skip)]
-    pub swap_outpoint: Option<String>,
-    #[garde(skip)]
-    pub swap_amount: Option<u64>,
-    #[garde(skip)]
-    pub swap_commit: Option<String>,
-}
-
-impl From<RgbBid> for RgbBidSwap {
-    fn from(value: RgbBid) -> Self {
-        let RgbBid {
-            bid_id,
-            offer_id,
-            contract_id,
-            asset_amount,
-            asset_precision,
-            bitcoin_amount,
-            buyer_psbt,
-            buyer_invoice,
-            pub_key,
-            transfer_id,
-            transfer,
-            iface,
-            swap_psbt,
-            ..
-        } = value;
-
-        Self {
-            bid_id,
-            offer_id,
-            contract_id,
-            iface,
-            asset_amount,
-            asset_precision,
-            bitcoin_amount,
-            buyer_psbt,
-            buyer_invoice,
-            pub_key,
-            transfer_id,
-            transfer,
-            swap_psbt,
-            ..Default::default()
+        // Debug: prev_outputs, allocation and inputs summary
+        {
+            let prev_dbg: Vec<String> = prev_outputs.iter().map(|o| o.to_string()).collect();
+            debug!(format!(
+                "offer.create_suppl prev_outputs_count={} prev_outputs={}",
+                prev_dbg.len(),
+                prev_dbg.join(",")
+            ));
+            debug!(format!(
+                "offer.create_suppl asset_available_amt={} allocation_inputs={} contract_inputs={}",
+                asset_available_amt,
+                allocation.len(),
+                contract_inputs.len()
+            ));
         }
-    }
-}
 
-#[derive(Clone, Serialize, Deserialize, Validate, Reconcile, Hydrate, Debug, Default, Display)]
-#[garde(context(RGBContext))]
-#[display("{bid_id}:{asset_amount} = {bitcoin_amount}")]
-pub struct PublicRgbBid {
-    #[garde(ascii)]
-    #[garde(length(min = 0, max = 100))]
-    pub bid_id: BidId,
-    #[garde(range(min = u64::MIN, max = u64::MAX))]
-    pub asset_amount: u64,
-    #[garde(range(min = u64::MIN, max = u64::MAX))]
-    pub bitcoin_amount: u64,
-    #[garde(ascii)]
-    pub pub_key: String,
-}
-
-impl From<RgbBidSwap> for PublicRgbBid {
-    fn from(value: RgbBidSwap) -> Self {
-        let RgbBidSwap {
-            bid_id,
-            asset_amount,
-            bitcoin_amount,
-            pub_key,
-            ..
-        } = value;
-
-        Self {
-            bid_id,
-            asset_amount,
-            bitcoin_amount,
-            pub_key,
+        // Debug: PSBT outputs derivations before selecting tapret host
+        {
+            let outs_dbg: Vec<String> = psbt
+                .outputs()
+                .enumerate()
+                .map(|(i, o)| {
+                    if let Some(der) = o.terminal_derivation() {
+                        format!("{}:{:?}/{:?}", i, der.keychain, der.index)
+                    } else {
+                        format!("{}:no-derivation", i)
+                    }
+                })
+                .collect();
+            debug!(format!(
+                "offer.create_suppl outputs_derivations_before_tapret={}",
+                outs_dbg.join(",")
+            ));
         }
-    }
-}
 
-#[derive(Clone, Serialize, Deserialize, Reconcile, Hydrate, Default, Debug)]
-pub struct RgbOffers {
-    pub offers: BTreeMap<AssetId, Vec<RgbOffer>>,
-    pub bids: BTreeMap<OfferId, BTreeMap<BidId, RgbBid>>,
-}
-
-impl RgbOffers {
-    pub fn get_offers(self, bundle_id: String) -> Vec<RgbOffer> {
-        let mut item = vec![];
-        for offers in self.offers.values() {
-            let offers = offers.to_vec();
-
-            item.extend(
-                offers
-                    .into_iter()
-                    .filter(|x| x.bundle_id.clone().unwrap_or_default() == bundle_id),
-            );
-        }
-        item
-    }
-
-    pub fn get_offer(self, offer_id: OfferId) -> Option<RgbOffer> {
-        let mut item = None;
-        for offers in self.offers.values() {
-            if let Some(offer) = offers.iter().find(|x| x.offer_id == offer_id) {
-                item = Some(offer.to_owned());
+        // Select tapret host explicitly on the seller's chosen change terminal
+        let mut found_tapret = false;
+        let mut host_vout_idx: Option<usize> = None;
+        for (i, out) in psbt.outputs_mut().enumerate() {
+            if let Some(der) = out.terminal_derivation()
+                && der.keychain == asset_keychain
+                && der.index == change_index
+            {
+                let _ = out.set_tapret_host();
+                found_tapret = true;
+                host_vout_idx = Some(i);
                 break;
             }
         }
-        item
-    }
-
-    pub fn save_offer(mut self, contract_id: AssetId, offer: RgbOffer) -> Self {
-        if let Some(offers) = self.offers.get(&contract_id) {
-            let mut available_offers = offers.to_owned();
-            if let Some(position) = available_offers
+        if !found_tapret {
+            return Err(OrderSupplError::NoContractOutpoint);
+        }
+        // Compute seller host scriptPubKey binding (hex) for preservation checks during merge
+        let mut host_spk_hex: Option<String> = None;
+        if let Some(vout) = host_vout_idx {
+            let spk = psbt.to_unsigned_tx().outputs[vout].script_pubkey.clone();
+            let hex = spk
+                .as_slice()
                 .iter()
-                .position(|x| x.offer_id == offer.offer_id)
-            {
-                available_offers.remove(position);
-                available_offers.insert(position, offer.clone());
-            } else {
-                available_offers.push(offer.clone());
-            }
-
-            available_offers.push(offer.clone());
-            self.offers.insert(contract_id, available_offers);
-        } else {
-            self.offers.insert(contract_id, vec![offer.clone()]);
-        }
-        self
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize, Reconcile, Hydrate, Default, Debug)]
-pub struct RgbBids {
-    pub bids: BTreeMap<AssetId, Vec<RgbBid>>,
-}
-
-impl RgbBids {
-    pub fn save_bid(mut self, contract_id: AssetId, bid: RgbBid) -> Self {
-        if let Some(offers) = self.bids.get(&contract_id) {
-            let mut available_bids: Vec<RgbBid> = offers.to_owned();
-            if let Some(position) = available_bids.iter().position(|x| x.bid_id == bid.bid_id) {
-                available_bids.remove(position);
-                available_bids.insert(position, bid.clone());
-            } else {
-                available_bids.push(bid.clone());
-            }
-
-            available_bids.push(bid.clone());
-            self.bids.insert(contract_id, available_bids);
-        } else {
-            self.bids.insert(contract_id, vec![bid.clone()]);
-        }
-        self
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize, Reconcile, Hydrate, Default, Debug)]
-pub struct RgbPublicSwaps {
-    pub offers: BTreeMap<AssetId, Vec<RgbOfferSwap>>,
-    pub bids: BTreeMap<OfferId, BTreeMap<BidId, PublicRgbBid>>,
-}
-
-impl RgbPublicSwaps {
-    pub fn get_offer(self, offer_id: OfferId) -> Option<RgbOfferSwap> {
-        let mut public_offers = vec![];
-        for offers in self.offers.values() {
-            public_offers.extend(offers);
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>();
+            host_spk_hex = Some(hex);
         }
 
-        public_offers
-            .into_iter()
-            .find(|x| x.offer_id == offer_id)
-            .cloned()
-    }
-
-    pub fn save_offer(mut self, contract_id: AssetId, offer: RgbOfferSwap) -> Self {
-        if let Some(offers) = self.offers.get(&contract_id) {
-            let mut available_offers = offers.to_owned();
-            if let Some(position) = available_offers
-                .iter()
-                .position(|x| x.offer_id == offer.offer_id)
-            {
-                available_offers.remove(position);
-                available_offers.insert(position, offer.clone());
-            } else {
-                available_offers.push(offer.clone());
-            }
-
-            available_offers.push(offer.clone());
-            self.offers.insert(contract_id, available_offers);
-        } else {
-            self.offers.insert(contract_id, vec![offer.clone()]);
-        }
-        self
-    }
-
-    pub fn save_bid(mut self, offer_id: OfferId, bid: RgbBidSwap) -> Self {
-        let new_public_bid = PublicRgbBid::from(bid);
-        let PublicRgbBid { bid_id, .. } = new_public_bid.clone();
-        if let Some(bids) = self.bids.get(&offer_id) {
-            let mut available_bids = bids.to_owned();
-            available_bids.insert(bid_id, new_public_bid);
-            self.bids.insert(offer_id.clone(), available_bids);
-        } else {
-            self.bids
-                .insert(offer_id.clone(), bmap! { bid_id => new_public_bid });
-        }
-        self
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize, Reconcile, Hydrate, Default, Debug)]
-pub struct RgbAuctionSwaps {
-    pub bundle_id: String,
-    pub strategy: RgbAuctionStrategy,
-    pub items: Vec<RgbOfferSwap>,
-    pub bids: BTreeMap<OfferId, Vec<RgbBidSwap>>,
-}
-
-impl RgbAuctionSwaps {
-    pub fn get_offer(self, bundle_id: String, offer_id: String) -> Option<RgbOfferSwap> {
-        self.items.into_iter().find(|x| {
-            x.bundle_id.clone().unwrap_or_default() == bundle_id && x.offer_id == offer_id
-        })
-    }
-
-    pub fn get_offers(self, bundle_id: String) -> Vec<RgbOfferSwap> {
-        self.items
-            .into_iter()
-            .filter(|x| x.bundle_id.clone().unwrap_or_default() == bundle_id)
-            .collect()
-    }
-
-    pub fn save_bid(mut self, offer_id: OfferId, bid: RgbBidSwap) -> Self {
-        let available_bids = if let Some(bids) = self.bids.get(&offer_id) {
-            let mut available_bids = bids.to_owned();
-            available_bids.push(bid);
-            available_bids
-        } else {
-            vec![bid]
-        };
-
-        self.bids.insert(offer_id.clone(), available_bids);
-        self
-    }
-
-    pub fn save_offers(mut self, offers: Vec<RgbOfferSwap>) -> Self {
-        for offer in offers.into_iter() {
-            self = self.save_offer(offer);
-        }
-        self
-    }
-
-    fn save_offer(mut self, offer: RgbOfferSwap) -> Self {
-        let mut available_offers = self.items.clone();
-        if let Some(position) = available_offers
-            .iter()
-            .position(|x| x.offer_id == offer.offer_id)
-        {
-            available_offers.remove(position);
-            available_offers.insert(position, offer.clone());
-        } else {
-            self.bundle_id = offer.bundle_id.clone().unwrap_or_default();
-            available_offers.push(offer.clone());
-        }
-        self.items = available_offers;
-        self
-    }
-}
-
-#[derive(Clone, Eq, PartialEq, Debug, Display, From, Error)]
-#[display(doc_comments)]
-pub enum RgbOfferErrors {
-    /// Occurs an error in retrieve offers. {0}
-    IO(RgbPersistenceError),
-    /// Occurs an error in retrieve keys. {0}
-    Keys(String),
-    /// Offer #{0} is not found in public orderbook.
-    NoOffer(String),
-    /// Bid #{0} is not found in public orderbook.
-    NoBid(String),
-    /// Collection offers empty
-    NoBundle,
-    /// Occurs an error in merge step. {0}
-    AutoMerge(String),
-}
-
-pub async fn get_public_offers() -> Result<Vec<RgbOfferSwap>, RgbOfferErrors> {
-    let LocalRgbOffers { rgb_offers, .. } =
-        retrieve_public_offers().await.map_err(RgbOfferErrors::IO)?;
-
-    let mut public_offers = vec![];
-    for offers in rgb_offers.offers.values() {
-        public_offers.extend(offers.iter().cloned());
-    }
-    Ok(public_offers)
-}
-
-pub async fn get_public_offer(offer_id: OfferId) -> Result<RgbOfferSwap, RgbOfferErrors> {
-    let LocalRgbOffers { rgb_offers, .. } =
-        retrieve_public_offers().await.map_err(RgbOfferErrors::IO)?;
-
-    let mut public_offers = vec![];
-    for offers in rgb_offers.offers.values() {
-        public_offers.extend(offers);
-    }
-
-    let offer = match public_offers.into_iter().find(|x| x.offer_id == offer_id) {
-        Some(offer) => offer.clone(),
-        _ => return Err(RgbOfferErrors::NoOffer(offer_id)),
-    };
-
-    Ok(offer)
-}
-
-pub async fn get_auction(bundle_id: &str) -> Result<Option<RgbAuctionSwaps>, RgbOfferErrors> {
-    let file_name = format!("bundle:{bundle_id}");
-
-    let LocalRgbAuctions { rgb_offers, .. } = retrieve_auctions_offers(bundle_id, &file_name)
-        .await
-        .map_err(RgbOfferErrors::IO)?;
-
-    Ok(Some(rgb_offers))
-}
-
-pub async fn get_auction_offer(
-    bundle_id: &str,
-    offer_id: OfferId,
-) -> Result<Option<RgbOfferSwap>, RgbOfferErrors> {
-    let file_name = format!("bundle:{bundle_id}");
-
-    let LocalRgbAuctions { rgb_offers, .. } = retrieve_auctions_offers(bundle_id, &file_name)
-        .await
-        .map_err(RgbOfferErrors::IO)?;
-
-    Ok(rgb_offers.get_offer(bundle_id.to_owned(), offer_id.clone()))
-}
-
-pub async fn get_public_bid(
-    offer_id: OfferId,
-    bid_id: BidId,
-) -> Result<PublicRgbBid, RgbOfferErrors> {
-    let LocalRgbOffers { rgb_offers, .. } =
-        retrieve_public_offers().await.map_err(RgbOfferErrors::IO)?;
-
-    let public_bids = match rgb_offers.bids.get(&offer_id) {
-        Some(bids) => bids,
-        _ => return Err(RgbOfferErrors::NoOffer(offer_id)),
-    };
-
-    let public_bid = match public_bids.get(&bid_id) {
-        Some(bid) => bid.clone(),
-        _ => return Err(RgbOfferErrors::NoBid(bid_id)),
-    };
-
-    Ok(public_bid)
-}
-
-pub async fn get_swap_bids_by_offer(
-    sk: &str,
-    offer: RgbOffer,
-) -> Result<Vec<RgbBidSwap>, RgbOfferErrors> {
-    let RgbOffer {
-        offer_id,
-        expire_at,
-        ..
-    } = offer;
-
-    let LocalRgbOffers { rgb_offers, .. } =
-        retrieve_public_offers().await.map_err(RgbOfferErrors::IO)?;
-
-    let public_bids: Vec<PublicRgbBid> = match rgb_offers.bids.get(&offer_id) {
-        Some(bids) => bids.values().cloned().collect(),
-        _ => return Err(RgbOfferErrors::NoOffer(offer_id)),
-    };
-
-    let mut swap_bids = vec![];
-    for bid in public_bids {
-        let PublicRgbBid {
-            bid_id,
-            pub_key: public,
-            ..
-        } = bid.clone();
-        let secret = hex::decode(sk).map_err(|op| RgbOfferErrors::Keys(op.to_string()))?;
-        let secret_key =
-            SecretKey::from_slice(&secret).map_err(|op| RgbOfferErrors::Keys(op.to_string()))?;
-        let public_key =
-            PublicKey::from_str(&public).map_err(|op| RgbOfferErrors::Keys(op.to_string()))?;
-
-        let share_sk = SharedSecret::new(&public_key, &secret_key);
-        let share_sk = share_sk.display_secret().to_string();
-
-        let file_name = format!("{offer_id}-{bid_id}");
-        match retrieve_swap_offer_bid(&share_sk, &file_name, expire_at).await {
-            Ok(local_copy) => swap_bids.push(local_copy.rgb_bid),
-            _ => continue,
-        }
-    }
-
-    Ok(swap_bids)
-}
-
-pub async fn get_swap_bid_by_seller(
-    sk: &str,
-    offer_id: String,
-    bid_id: BidId,
-    expire_at: Option<i64>,
-) -> Result<RgbBidSwap, RgbOfferErrors> {
-    let bid = get_public_bid(offer_id.clone(), bid_id.clone()).await?;
-
-    let secret = hex::decode(sk).map_err(|op| RgbOfferErrors::Keys(op.to_string()))?;
-    let secret_key =
-        SecretKey::from_slice(&secret).map_err(|op| RgbOfferErrors::Keys(op.to_string()))?;
-    let public_key =
-        PublicKey::from_str(&bid.pub_key).map_err(|op| RgbOfferErrors::Keys(op.to_string()))?;
-
-    let share_sk = SharedSecret::new(&public_key, &secret_key);
-    let share_sk = share_sk.display_secret().to_string();
-
-    let file_name = format!("{offer_id}-{bid_id}");
-    let LocalRgbOfferBid { rgb_bid, .. } =
-        retrieve_swap_offer_bid(&share_sk, &file_name, expire_at)
-            .await
-            .map_err(RgbOfferErrors::IO)?;
-
-    Ok(rgb_bid)
-}
-
-pub async fn get_swap_bid_by_buyer(
-    sk: &str,
-    offer_id: String,
-    bid_id: BidId,
-) -> Result<RgbBidSwap, RgbOfferErrors> {
-    let RgbOfferSwap {
-        expire_at,
-        pub_key: public,
-        ..
-    } = get_public_offer(offer_id.clone()).await?;
-
-    let secret = hex::decode(sk).map_err(|op| RgbOfferErrors::Keys(op.to_string()))?;
-    let secret_key =
-        SecretKey::from_slice(&secret).map_err(|op| RgbOfferErrors::Keys(op.to_string()))?;
-    let public_key =
-        PublicKey::from_str(&public).map_err(|op| RgbOfferErrors::Keys(op.to_string()))?;
-
-    let share_sk = SharedSecret::new(&public_key, &secret_key);
-    let share_sk = share_sk.display_secret().to_string();
-
-    let file_name = format!("{offer_id}-{bid_id}");
-    let LocalRgbOfferBid { rgb_bid, .. } =
-        retrieve_swap_offer_bid(&share_sk, &file_name, expire_at)
-            .await
-            .map_err(RgbOfferErrors::IO)?;
-
-    Ok(rgb_bid)
-}
-
-pub async fn get_auction_highest_bids(
-    bundle_id: String,
-) -> Result<BTreeMap<OfferId, Vec<RgbBidSwap>>, RgbOfferErrors> {
-    let file_name = format!("bundle:{bundle_id}");
-    let LocalRgbAuctions { rgb_offers, .. } = retrieve_auctions_offers(&bundle_id, &file_name)
-        .await
-        .map_err(RgbOfferErrors::IO)?;
-
-    let mut highest_bids = bmap! {};
-    for RgbOfferSwap { offer_id, .. } in rgb_offers.clone().get_offers(bundle_id) {
-        if let Some(bids) = rgb_offers.bids.get(&offer_id).cloned() {
-            if let Some(bid) = bids.iter().max_by_key(|x| x.bitcoin_amount).cloned() {
-                highest_bids.insert(offer_id, vec![bid]);
-            }
-        };
-    }
-
-    Ok(highest_bids)
-}
-
-pub async fn get_auction_fifo_bids(
-    bundle_id: String,
-) -> Result<BTreeMap<OfferId, Vec<RgbBidSwap>>, RgbOfferErrors> {
-    let file_name = format!("bundle:{bundle_id}");
-    let LocalRgbAuctions { rgb_offers, .. } = retrieve_auctions_offers(&bundle_id, &file_name)
-        .await
-        .map_err(RgbOfferErrors::IO)?;
-
-    let mut first_bids = bmap! {};
-    for RgbOfferSwap { offer_id, .. } in rgb_offers.clone().get_offers(bundle_id) {
-        if let Some(bids) = rgb_offers.bids.get(&offer_id).cloned() {
-            first_bids.insert(offer_id, bids);
-        };
-    }
-
-    Ok(first_bids)
-}
-
-pub async fn get_auction_highest_bid(
-    bundle_id: String,
-    offer_id: OfferId,
-) -> Result<Option<RgbBidSwap>, RgbOfferErrors> {
-    let file_name = format!("bundle:{bundle_id}");
-
-    let LocalRgbAuctions { rgb_offers, .. } = retrieve_auctions_offers(&bundle_id, &file_name)
-        .await
-        .map_err(RgbOfferErrors::IO)?;
-
-    if rgb_offers
-        .clone()
-        .get_offer(bundle_id.to_owned(), offer_id.clone())
-        .is_none()
-    {
-        return Err(RgbOfferErrors::NoOffer(offer_id.clone()));
-    }
-
-    let highest_bid = if let Some(bids) = rgb_offers.bids.get(&offer_id) {
-        bids.iter().max_by_key(|x| x.bitcoin_amount).cloned()
-    } else {
-        None
-    };
-
-    Ok(highest_bid)
-}
-
-pub async fn publish_public_offer(new_offer: RgbOfferSwap) -> Result<(), RgbOfferErrors> {
-    let LocalRgbOffers {
-        mut rgb_offers,
-        version,
-    } = retrieve_public_offers().await.map_err(RgbOfferErrors::IO)?;
-
-    let mut current_version = automerge::AutoCommit::load(&version)
-        .map_err(|op| RgbOfferErrors::AutoMerge(op.to_string()))?;
-
-    let contract_id = new_offer.contract_id.clone();
-    rgb_offers = rgb_offers.save_offer(contract_id, new_offer);
-
-    reconcile(&mut current_version, rgb_offers)
-        .map_err(|op| RgbOfferErrors::AutoMerge(op.to_string()))?;
-
-    store_public_offers(current_version.save())
-        .await
-        .map_err(RgbOfferErrors::IO)?;
-
-    Ok(())
-}
-
-pub async fn publish_public_offers(new_offers: Vec<RgbOfferSwap>) -> Result<(), RgbOfferErrors> {
-    let LocalRgbOffers {
-        mut rgb_offers,
-        version,
-    } = retrieve_public_offers().await.map_err(RgbOfferErrors::IO)?;
-
-    let mut current_version = automerge::AutoCommit::load(&version)
-        .map_err(|op| RgbOfferErrors::AutoMerge(op.to_string()))?;
-
-    for new_offer in new_offers {
-        let contract_id = new_offer.contract_id.clone();
-        rgb_offers = rgb_offers.save_offer(contract_id, new_offer);
-    }
-
-    reconcile(&mut current_version, rgb_offers)
-        .map_err(|op| RgbOfferErrors::AutoMerge(op.to_string()))?;
-
-    store_public_offers(current_version.save())
-        .await
-        .map_err(RgbOfferErrors::IO)?;
-
-    Ok(())
-}
-
-pub async fn publish_public_bid(new_bid: RgbBidSwap) -> Result<(), RgbOfferErrors> {
-    let RgbBidSwap { offer_id, .. } = new_bid.clone();
-
-    let _ = get_public_offer(offer_id.clone()).await?;
-    let LocalRgbOffers {
-        mut rgb_offers,
-        version,
-    } = retrieve_public_offers().await.map_err(RgbOfferErrors::IO)?;
-
-    let mut local_copy = automerge::AutoCommit::load(&version)
-        .map_err(|op| RgbOfferErrors::AutoMerge(op.to_string()))?;
-
-    rgb_offers = rgb_offers.save_bid(offer_id, new_bid);
-    reconcile(&mut local_copy, rgb_offers)
-        .map_err(|op| RgbOfferErrors::AutoMerge(op.to_string()))?;
-
-    store_public_offers(local_copy.save())
-        .await
-        .map_err(RgbOfferErrors::IO)?;
-
-    Ok(())
-}
-
-pub async fn publish_swap_bid(
-    sk: &str,
-    offer_pub: &str,
-    new_bid: RgbBidSwap,
-    expire_at: Option<i64>,
-) -> Result<(), RgbOfferErrors> {
-    let RgbBidSwap {
-        bid_id, offer_id, ..
-    } = new_bid.clone();
-
-    let secret = hex::decode(sk).map_err(|op| RgbOfferErrors::Keys(op.to_string()))?;
-    let secret_key =
-        SecretKey::from_slice(&secret).map_err(|op| RgbOfferErrors::Keys(op.to_string()))?;
-    let public_key =
-        PublicKey::from_str(offer_pub).map_err(|op| RgbOfferErrors::Keys(op.to_string()))?;
-
-    let share_sk = SharedSecret::new(&public_key, &secret_key);
-    let share_sk = share_sk.display_secret().to_string();
-
-    let file_name = format!("{offer_id}-{bid_id}");
-
-    let LocalRgbOfferBid { version, .. } =
-        retrieve_swap_offer_bid(&share_sk, &file_name, expire_at)
-            .await
-            .map_err(RgbOfferErrors::IO)?;
-
-    let mut local_copy = automerge::AutoCommit::load(&version)
-        .map_err(|op| RgbOfferErrors::AutoMerge(op.to_string()))?;
-
-    reconcile(&mut local_copy, new_bid).map_err(|op| RgbOfferErrors::AutoMerge(op.to_string()))?;
-
-    store_swap_bids(&share_sk, &file_name, local_copy.save(), expire_at)
-        .await
-        .map_err(RgbOfferErrors::IO)?;
-
-    Ok(())
-}
-
-pub async fn publish_auction_offers(
-    strategy: RgbAuctionStrategy,
-    new_offers: Vec<RgbOfferSwap>,
-) -> Result<(), RgbOfferErrors> {
-    let RgbOfferSwap { bundle_id, .. } = new_offers[0].clone();
-    let bundle_id = bundle_id.unwrap_or_default();
-    let file_name = format!("bundle:{bundle_id}");
-
-    let LocalRgbAuctions {
-        mut rgb_offers,
-        version,
-    } = retrieve_auctions_offers(&bundle_id, &file_name)
-        .await
-        .map_err(RgbOfferErrors::IO)?;
-
-    let mut current_version = automerge::AutoCommit::load(&version)
-        .map_err(|op| RgbOfferErrors::AutoMerge(op.to_string()))?;
-
-    rgb_offers = rgb_offers.save_offers(new_offers.clone());
-    rgb_offers.strategy = strategy;
-
-    reconcile(&mut current_version, rgb_offers.clone())
-        .map_err(|op| RgbOfferErrors::AutoMerge(op.to_string()))?;
-
-    store_auction_offers(&bundle_id, &file_name, current_version.save())
-        .await
-        .map_err(RgbOfferErrors::IO)?;
-
-    publish_public_offers(new_offers).await?;
-    Ok(())
-}
-
-pub async fn publish_auction_bid(new_bid: RgbBidSwap) -> Result<(), RgbOfferErrors> {
-    let RgbBidSwap { offer_id, .. } = new_bid.clone();
-    let RgbOfferSwap { bundle_id, .. } = get_public_offer(offer_id.clone()).await?;
-    let bundle_id = bundle_id.unwrap_or_default();
-    let file_name = format!("bundle:{bundle_id}");
-
-    let LocalRgbAuctions {
-        mut rgb_offers,
-        version,
-    } = retrieve_auctions_offers(&bundle_id, &file_name)
-        .await
-        .map_err(RgbOfferErrors::IO)?;
-
-    let mut local_copy = automerge::AutoCommit::load(&version)
-        .map_err(|op| RgbOfferErrors::AutoMerge(op.to_string()))?;
-
-    rgb_offers = rgb_offers.save_bid(offer_id.clone(), new_bid.clone());
-    reconcile(&mut local_copy, rgb_offers)
-        .map_err(|op| RgbOfferErrors::AutoMerge(op.to_string()))?;
-
-    store_auction_offers(&bundle_id, &file_name, local_copy.save())
-        .await
-        .map_err(RgbOfferErrors::IO)?;
-
-    Ok(())
-}
-
-pub async fn remove_public_offers(offers: Vec<RgbOffer>) -> Result<(), RgbOfferErrors> {
-    let LocalRgbOffers {
-        mut rgb_offers,
-        version,
-    } = retrieve_public_offers().await.map_err(RgbOfferErrors::IO)?;
-
-    let mut local_copy = automerge::AutoCommit::load(&version)
-        .map_err(|op| RgbOfferErrors::AutoMerge(op.to_string()))?;
-
-    let current_public_offers = rgb_offers.clone();
-    for offer in offers {
-        if let Some(public_offers) = current_public_offers.offers.get(&offer.contract_id) {
-            let public_offers = public_offers.to_owned();
-            if public_offers.iter().any(|x| x.offer_id == offer.offer_id) {
-                let others = public_offers
-                    .iter()
-                    .filter(|x| x.offer_id != offer.offer_id)
-                    .map(|x| x.to_owned())
-                    .collect();
-                rgb_offers.offers.insert(offer.contract_id, others);
-                rgb_offers.bids.remove(&offer.offer_id);
-            }
-        }
-    }
-
-    // TODO: Add change verification (accept only addition operation)
-    reconcile(&mut local_copy, rgb_offers)
-        .map_err(|op| RgbOfferErrors::AutoMerge(op.to_string()))?;
-
-    store_public_offers(local_copy.save())
-        .await
-        .map_err(RgbOfferErrors::IO)?;
-
-    Ok(())
-}
-
-pub async fn update_transfer_offer(
-    offer_id: OfferId,
-    consig_id: TransferId,
-    rgb_offers: &mut RgbOffers,
-) -> Result<(), RgbOfferErrors> {
-    let offers = rgb_offers.offers.clone();
-    for (contract_id, mut my_offers) in offers {
-        if let Some(position) = my_offers.iter().position(|x| x.offer_id == offer_id) {
-            let mut offer = my_offers.swap_remove(position);
-            offer.transfer_id = Some(consig_id.to_owned());
-
-            my_offers.insert(position, offer);
-            rgb_offers.offers.insert(contract_id, my_offers);
-            break;
-        }
-    }
-    Ok(())
-}
-
-pub async fn update_transfer_bid(
-    bid_id: BidId,
-    consig_id: TransferId,
-    rgb_bids: &mut RgbBids,
-) -> Result<(), RgbOfferErrors> {
-    let bids = rgb_bids.bids.clone();
-    for (contract_id, mut my_bids) in bids {
-        if let Some(position) = my_bids.iter().position(|x| x.bid_id == bid_id) {
-            let mut offer = my_bids.swap_remove(position);
-            offer.transfer_id = Some(consig_id.to_owned());
-
-            my_bids.insert(position, offer);
-            rgb_bids.bids.insert(contract_id, my_bids);
-            break;
-        }
-    }
-    Ok(())
-}
-
-pub async fn complete_offer(
-    transfer_id: TransferId,
-    rgb_offers: &mut RgbOffers,
-) -> Result<Option<RgbOffer>, RgbOfferErrors> {
-    let mut offer_filled = None;
-    let offers = rgb_offers.offers.clone();
-    for (contract_id, mut my_offers) in offers {
-        if let Some(position) = my_offers
-            .clone()
-            .into_iter()
-            .position(|x| x.transfer_id.unwrap_or_default() == transfer_id)
-        {
-            let mut offer = my_offers.swap_remove(position);
-            offer.status = RgbOrderStatus::Fill;
-
-            offer_filled = Some(offer.clone());
-            my_offers.insert(position, offer);
-            rgb_offers.offers.insert(contract_id, my_offers);
-
-            break;
-        }
-    }
-    Ok(offer_filled)
-}
-
-pub async fn complete_bid(
-    transfer_id: TransferId,
-    rgb_bids: &mut RgbBids,
-) -> Result<Option<RgbBid>, RgbOfferErrors> {
-    let mut bid_filled = None;
-    let bids = rgb_bids.bids.clone();
-    for (contract_id, mut my_bids) in bids {
-        if let Some(position) = my_bids
-            .clone()
-            .into_iter()
-            .position(|x| x.transfer_id.unwrap_or_default() == transfer_id)
-        {
-            let mut bid = my_bids.swap_remove(position);
-            bid.status = RgbOrderStatus::Fill;
-
-            bid_filled = Some(bid.clone());
-            my_bids.insert(position, bid);
-            rgb_bids.bids.insert(contract_id, my_bids);
-
-            break;
-        }
-    }
-    Ok(bid_filled)
-}
-
-#[derive(Clone, Eq, PartialEq, Debug, Display, Error, From)]
-#[display(doc_comments)]
-pub enum PsbtSwapExError {
-    /// The Input PSBT is invalid (Unexpected behavior).
-    Inconclusive,
-}
-
-pub trait PsbtSwapEx<T> {
-    type Error: std::error::Error;
-
-    /// Join this [`PartiallySignedTransaction`] with `other` PSBT as described by BIP 174.
-    ///
-    /// The join method emulate the same behavior of the rpc method `joinpsbts`
-    /// See: https://developer.bitcoin.org/reference/rpc/joinpsbts.html
-    fn join(self, other: T) -> Result<T, Self::Error>;
-}
-
-impl PsbtSwapEx<PsbtV0> for PsbtV0 {
-    type Error = PsbtSwapExError;
-
-    fn join(self, other: PsbtV0) -> Result<PsbtV0, Self::Error> {
-        // BIP 174: The Combiner must remove any duplicate key-value pairs, in accordance with
-        //          the specification. It can pick arbitrarily when conflicts occur.
-
-        // Keeping the highest version
-        let mut new_psbt = PsbtV0::from(self).clone();
-        // let mut other = other;
-        new_psbt.version = cmp::max(new_psbt.version, other.version);
-
-        // Merging xpubs
-        for (xpub, (fingerprint1, derivation1)) in other.xpub {
-            match new_psbt.xpub.entry(xpub) {
-                btree_map::Entry::Vacant(entry) => {
-                    entry.insert((fingerprint1, derivation1));
-                }
-                btree_map::Entry::Occupied(mut entry) => {
-                    // Here in case of the conflict we select the version with algorithm:
-                    // 1) if everything is equal we do nothing
-                    // 2) report an error if
-                    //    - derivation paths are equal and fingerprints are not
-                    //    - derivation paths are of the same length, but not equal
-                    //    - derivation paths has different length, but the shorter one
-                    //      is not the strict suffix of the longer one
-                    // 3) choose longest derivation otherwise
-
-                    let (fingerprint2, derivation2) = entry.get().clone();
-
-                    if (derivation1 == derivation2 && fingerprint1 == fingerprint2)
-                        || (derivation1.len() < derivation2.len()
-                            && derivation1[..]
-                                == derivation2[derivation2.len() - derivation1.len()..])
-                    {
-                        continue;
-                    } else if derivation2[..]
-                        == derivation1[derivation1.len() - derivation2.len()..]
-                    {
-                        entry.insert((fingerprint1, derivation1));
-                        continue;
-                    }
-                    return Err(PsbtSwapExError::Inconclusive);
-                }
-            }
-        }
-
-        new_psbt.proprietary.extend(other.proprietary);
-        new_psbt.unknown.extend(other.unknown);
-
-        // new_psbt.inputs.extend(other.inputs);
-        let current_inputs = new_psbt.inputs.clone();
-        let new_inputs = other.inputs.clone();
-        new_inputs.into_iter().for_each(|vin| {
-            if !current_inputs.clone().into_iter().any(|x| {
-                x.bip32_derivation == vin.bip32_derivation
-                    && x.non_witness_utxo.eq(&vin.non_witness_utxo)
+        for (output, contract_id) in &allocation {
+            if let Some(input) = psbt.inputs_mut().find(|x| {
+                x.previous_outpoint == crate::rgb::compat::outpoint_bitcoin_to_bp(*output)
             }) {
-                new_psbt.inputs.push(vin);
+                let amount = self.amount().to_value();
+                let allocated = if asset_available_amt > 0 && amount < asset_available_amt {
+                    asset_available_amt - amount
+                } else {
+                    0
+                };
+
+                let _ = input.set_rgb_offer_in(*contract_id, allocated);
             }
-        });
-
-        let current_outputs = new_psbt.outputs.clone();
-        let new_outputs = other.outputs.clone();
-        new_outputs.into_iter().for_each(|out| {
-            if !current_outputs
-                .clone()
-                .into_iter()
-                .any(|x| x.bip32_derivation == out.bip32_derivation)
-            {
-                new_psbt.outputs.push(out);
-            }
-        });
-
-        // Transaction
-        new_psbt.unsigned_tx.version =
-            cmp::max(new_psbt.unsigned_tx.version, other.unsigned_tx.version);
-
-        new_psbt.unsigned_tx.lock_time =
-            cmp::max(new_psbt.unsigned_tx.lock_time, other.unsigned_tx.lock_time);
-
-        // new_psbt.unsigned_tx.input.extend(other.unsigned_tx.input);
-        let current_inputs = new_psbt.unsigned_tx.input.clone();
-        let new_inputs = other.unsigned_tx.input.clone();
-        new_inputs.into_iter().for_each(|vin| {
-            if !current_inputs
-                .clone()
-                .into_iter()
-                .any(|x| x.previous_output.eq(&vin.previous_output))
-            {
-                new_psbt.unsigned_tx.input.push(vin);
-            }
-        });
-
-        let current_outputs = new_psbt.unsigned_tx.output.clone();
-        let new_outputs = other.unsigned_tx.output.clone();
-        new_outputs.into_iter().for_each(|out| {
-            if !current_outputs
-                .clone()
-                .into_iter()
-                .any(|x| x.script_pubkey == out.script_pubkey && x.value == out.value)
-            {
-                new_psbt.unsigned_tx.output.push(out);
-            }
-        });
-
-        Ok(new_psbt.clone())
-    }
-}
-
-/// Swap Order identifier.
-///
-/// Interface identifier commits to all of the interface data.
-#[derive(
-    Wrapper,
-    Copy,
-    Clone,
-    Ord,
-    PartialOrd,
-    Eq,
-    PartialEq,
-    Hash,
-    Debug,
-    From,
-    StrictType,
-    StrictDumb,
-    StrictEncode,
-    StrictDecode,
-)]
-#[wrapper(Deref, BorrowSlice, Hex, Index, RangeOps)]
-#[strict_type(lib = LIB_NAME_BITMASK)]
-#[cfg_attr(
-    feature = "serde",
-    derive(Serialize, Deserialize),
-    serde(crate = "serde_crate", transparent)
-)]
-pub struct OrderId(
-    #[from]
-    #[from([u8; 32])]
-    Bytes32,
-);
-
-impl ToBaid58<32> for OrderId {
-    const HRI: &'static str = "swap";
-    fn to_baid58_payload(&self) -> [u8; 32] {
-        self.to_byte_array()
-    }
-}
-impl FromBaid58<32> for OrderId {}
-impl Display for OrderId {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        if f.sign_minus() {
-            write!(f, "urn:diba:{::<}", self.to_baid58())
-        } else {
-            write!(f, "urn:diba:{::<#}", self.to_baid58())
         }
-    }
-}
-impl FromStr for OrderId {
-    type Err = Baid58ParseError;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::from_baid58_str(s.trim_start_matches("urn:diba:"))
-    }
-}
 
-#[deprecated(note = "removed in favor to compatibility with other wallets")]
-#[derive(Clone, Debug, StrictType, StrictDumb, StrictEncode, StrictDecode)]
-#[strict_type(lib = LIB_NAME_BITMASK)]
-#[cfg_attr(
-    feature = "serde",
-    derive(Serialize, Deserialize),
-    serde(crate = "serde_crate", rename_all = "camelCase")
-)]
+        // Retrieve all bundles
+        let stash = rgb_stock.as_stash_provider().clone_no_persistence();
+        let index = rgb_stock.as_index_provider().clone_no_persistence();
 
-pub struct TransferSwap {
-    pub offer_id: OrderId,
-    pub bid_id: OrderId,
-    pub consig: Transfer,
-}
+        #[allow(clippy::expect_used)]
+        let mut current_opouts = index
+            .public_opouts(contract_id)
+            .expect("Infallible index read");
 
-impl StrictSerialize for TransferSwap {}
-impl StrictDeserialize for TransferSwap {}
+        #[allow(clippy::expect_used)]
+        let outputs = allocation.clone().into_keys();
+        current_opouts.extend(
+            index
+                .opouts_by_outputs(contract_id, outputs)
+                .expect("Infallible index read"),
+        );
 
-impl TransferSwap {
-    pub fn with(offer_id: &str, bid_id: &str, transfer: Transfer) -> Self {
-        let offer_id = OrderId::from_str(offer_id).expect("Invalid rgb offer Id");
-        let bid_id = OrderId::from_str(bid_id).expect("Invalid rgb bid Id");
+        current_opouts.extend(
+            index
+                .opouts_by_outputs(
+                    contract_id,
+                    prev_allocatinos
+                        .iter()
+                        .copied()
+                        .map(crate::rgb::compat::outpoint_bp_to_bitcoin),
+                )
+                .expect("Infallible index read"),
+        );
 
-        Self {
-            offer_id,
-            bid_id,
-            consig: transfer,
+        let mut anchors = bmap! {};
+        let mut previous_opouts = vec![];
+        for opout in current_opouts {
+            if previous_opouts.contains(&opout) {
+                continue;
+            }
+            if let Ok(bundle_id) = index.bundle_id_for_op(opout.op) {
+                if let Ok(bundle) = stash.bundle(bundle_id) {
+                    let transitions = bundle
+                        .known_transitions
+                        .iter()
+                        .filter(|known| known.opid == opout.op)
+                        .map(|known| known.transition.clone());
+
+                    transitions.for_each(|transition| {
+                        transition
+                            .assignments
+                            .iter()
+                            .find(|(ty, _)| *ty == &opout.ty)
+                            .map(|(_, assignments)| assignments)
+                            .iter()
+                            .for_each(|x| {
+                                let mut seals_reveled = vec![];
+                                let count = x.len_u16();
+                                for index in 0..count {
+                                    if let Ok(Some(reveal)) = x.revealed_seal_at(index) {
+                                        seals_reveled.push(reveal);
+                                    }
+                                }
+
+                                #[allow(clippy::expect_used)]
+                                let (witness_ids, _) =
+                                    index.bundle_info(bundle_id).expect("Infallible index read");
+
+                                for witness_id in witness_ids {
+                                    #[allow(clippy::expect_used)]
+                                    let witness_seal = stash
+                                        .witness(witness_id)
+                                        .expect("Infallible stash provider");
+
+                                    anchors.insert(
+                                        witness_seal.witness_id(),
+                                        AnchorShard::new(witness_seal.clone(), bundle.clone()),
+                                    );
+                                }
+                            });
+                    });
+                }
+                previous_opouts.push(opout);
+            }
         }
-    }
-}
 
-#[derive(Clone, Eq, PartialEq, Debug, Display, Error, From)]
-#[display(doc_comments)]
-// TODO: Complete errors
-pub enum TransferSwapError {
-    /// Consignment data have an invalid hexadecimal format.
-    WrongHex,
-    /// ContractID cannot be decoded. {0}
-    WrongContract(String),
-    /// Consignment cannot be decoded. {0}
-    WrongConsig(String),
-    /// Network cannot be decoded. {0}
-    WrongNetwork(String),
-    /// The Consignment is invalid. Details: {0:?}
-    InvalidConsig(Vec<String>),
-    /// The Consignment is invalid (Unexpected behavior on validation).
-    Inconclusive,
-}
+        // Prepare other transition
+        let mut extra_state =
+            HashMap::<ContractId, HashMap<OutputSeal, HashMap<Opout, AllocatedState>>>::new();
 
-#[deprecated(note = "removed in favor to compatibility with other wallets")]
-pub fn extract_transfer(
-    transfer: String,
-) -> Result<(Txid, Bindle<Transfer>, OrderId, OrderId), TransferSwapError> {
-    let serialized = Vec::<u8>::from_hex(&transfer).map_err(|_| TransferSwapError::WrongHex)?;
-    let confined = Confined::try_from_iter(serialized.iter().copied())
-        .map_err(|err| TransferSwapError::WrongConsig(err.to_string()))?;
+        let another_contracts = rgb_stock
+            .contracts_assigning(
+                prev_outputs
+                    .iter()
+                    .filter(|op| {
+                        inputs
+                            .iter()
+                            .any(|x| crate::rgb::compat::outpoint_bitcoin_to_bp(x.outpoint) == **op)
+                    })
+                    .copied()
+                    .map(crate::rgb::compat::outpoint_bp_to_bitcoin),
+            )
+            .map_err(|_| OrderSupplError::NoContractOutpoint)?;
+        {
+            // Diagnostic: enumerate contracts assigning to the same prevouts (excluding offered one)
+            if let Ok(it) = rgb_stock.contracts_assigning(
+                prev_outputs
+                    .iter()
+                    .filter(|op| {
+                        inputs
+                            .iter()
+                            .any(|x| crate::rgb::compat::outpoint_bitcoin_to_bp(x.outpoint) == **op)
+                    })
+                    .copied()
+                    .map(crate::rgb::compat::outpoint_bp_to_bitcoin),
+            ) {
+                let ids: Vec<String> = it.map(|id| id.to_string()).collect();
+                debug!(format!(
+                    "offer.create_suppl another_contracts_on_prevouts={} [{}]",
+                    ids.len(),
+                    ids.join(",")
+                ));
+            }
+        }
 
-    let transfer_swap = TransferSwap::from_strict_serialized::<{ U32 }>(confined)
-        .map_err(|err| TransferSwapError::WrongConsig(err.to_string()))?;
+        for id in another_contracts {
+            // Skip current contract
+            if id == contract_id {
+                continue;
+            }
 
-    let transfer = transfer_swap.consig;
-    for (bundle_id, _) in transfer.terminals() {
-        if transfer.known_transitions_by_bundle_id(bundle_id).is_none() {
-            return Err(TransferSwapError::Inconclusive);
-        };
-        if let Some(AnchoredBundle { anchor, bundle: _ }) = transfer.anchored_bundle(bundle_id) {
-            return Ok((
-                anchor.txid,
-                Bindle::new(transfer),
-                transfer_swap.offer_id,
-                transfer_swap.bid_id,
+            let state = rgb_stock
+                .contract_assignments_for(
+                    id,
+                    prev_outputs
+                        .iter()
+                        .copied()
+                        .map(crate::rgb::compat::outpoint_bp_to_bitcoin),
+                )
+                .map_err(|e| OrderSupplError::WrongBlank(e.to_string()))?;
+
+            // FIX: Skip contracts with no allocations on the UTXOs being spent
+            // contracts_assigning() returns contracts based on index/witness references,
+            // but they may not have actual OUTPUT allocations on these specific UTXOs
+            if state.is_empty() {
+                debug!(format!(
+                    "offer.extras.skip_empty contract_id={} reason=no_allocations_on_spent_utxos",
+                    id
+                ));
+                continue;
+            }
+
+            let entry = extra_state.entry(id).or_default();
+            for (seal, assigns) in state {
+                entry.entry(seal).or_default().extend(assigns);
+            }
+        }
+
+        let mut extra_contracts = vec![];
+        for (contract_id, contract_states) in extra_state {
+            let mut states: BTreeMap<Opout, AllocatedState> = BTreeMap::new();
+            for (output_seal, contract_state) in contract_states {
+                if let Some(input) = psbt.inputs_mut().find(|x| {
+                    x.previous_outpoint
+                        == crate::rgb::compat::outpoint_bitcoin_to_bp(output_seal.to_outpoint())
+                }) {
+                    let mut allocated = 0;
+                    for (opout, state) in contract_state.clone() {
+                        match state {
+                            AllocatedState::Void => {}
+                            AllocatedState::Amount(amount) => {
+                                allocated += amount.as_u64();
+                            }
+                            AllocatedState::Data(_) => {
+                                allocated = 1;
+                            }
+                        }
+
+                        states.insert(opout, state);
+                    }
+
+                    let _ = input.set_rgb_offer_in(contract_id, allocated);
+                }
+            }
+
+            let contract_exported = rgb_stock
+                .export_contract(contract_id)
+                .map_err(|_| OrderSupplError::NoContract(contract_id.to_string()))?;
+
+            // Collect anchors by iterating through the states (opouts) that are part of this swap
+            let mut anchors: BTreeMap<rgbcore::Txid, AnchorShard> = BTreeMap::new();
+            let stash = rgb_stock.as_stash_provider().clone_no_persistence();
+            let index = rgb_stock.as_index_provider().clone_no_persistence();
+
+            debug!(format!(
+                "offer.extra_anchor.start contract_id={} states_count={}",
+                contract_id,
+                states.len()
+            ));
+
+            for opout in states.keys() {
+                // Get the bundle that created this opout
+                if let Ok(bundle_id) = index.bundle_id_for_op(opout.op)
+                    && let Ok(bundle) = stash.bundle(bundle_id)
+                    && let Ok((witness_ids, _)) = index.bundle_info(bundle_id)
+                {
+                    for witness_id in witness_ids {
+                        if let Ok(witness_seal) = stash.witness(witness_id) {
+                            anchors.insert(
+                                witness_seal.witness_id(),
+                                AnchorShard::new(witness_seal.clone(), bundle.clone()),
+                            );
+                            debug!(format!(
+                                "offer.extra_anchor.collected contract_id={} witness_id={}",
+                                contract_id,
+                                witness_seal.witness_id()
+                            ));
+                        }
+                    }
+                }
+            }
+
+            debug!(format!(
+                "offer.extra_anchor.finish contract_id={} anchors_count={}",
+                contract_id,
+                anchors.len()
+            ));
+
+            let rgb_shard = RgbExtraShard::new(contract_id, contract_exported, states, anchors);
+            extra_contracts.push(rgb_shard);
+        }
+        // Debug: list extra contracts discovered for seller
+        {
+            let ids: Vec<String> = extra_contracts
+                .iter()
+                .map(|s| s.contract_id.to_string())
+                .collect();
+            debug!(format!(
+                "offer.create_suppl extra_contract_ids={} [{}]",
+                ids.len(),
+                ids.join(",")
             ));
         }
-    }
 
-    Err(TransferSwapError::Inconclusive)
+        // Note: Early pending_host registration for historical witness outpoints removed.
+        // Historical outpoints are already known to wallet via indexing.
+        // Swap outputs are registered during verification (rgb.rs:647-685).
+
+        let seal = GraphSeal::new_random_vout(crate::rgb::compat::vout_bp_to_rgb(change_vout));
+        rgb_stock
+            .store_secret_seal(seal)
+            .map_err(|_| OrderSupplError::WrongCounterParty)?;
+
+        let mut suppl = OrderSuppl::rgb(contract_inputs, anchors, extra_contracts, psbt);
+        // Persist seller host terminal so runtime can save tapret metadata against the correct derivation
+        suppl.seller_host_terminal = Some(HostTerminal {
+            keychain: asset_keychain,
+            index: change_index,
+        });
+        // Persist strong host binding (scriptPubKey)
+        suppl.seller_host_spk = host_spk_hex;
+        suppl.add_seal(seal.to_secret_seal());
+
+        Ok(suppl)
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Default)]
+pub struct NewBidParams {
+    chain_fee: ChainFee,
+}
+
+impl NewBidParams {
+    pub fn with(chain_fee: ChainFee) -> Self {
+        Self { chain_fee }
+    }
+}
+
+impl RgbBid {
+    pub(crate) fn create_suppl(
+        &mut self,
+        params: NewBidParams,
+        btc_account: &mut BtcAccount,
+        rgb_account: &mut RgbAccount,
+        rgb_stock: &mut RGBStock,
+    ) -> Result<OrderSuppl, OrderSupplError> {
+        let btc_wallet = btc_account.wallet.clone_no_persistence();
+        let rgb_wallet = rgb_account.wallet.clone_no_persistence();
+        let seqno = SeqNo::from_consensus_u32(0);
+
+        // ::: Create PSBT :::
+        let mut psbt = Psbt::create(PsbtVer::V2);
+
+        // Inputs
+        let inputs = self.inputs();
+
+        // Debug planned inputs
+        let planned_sum: Sats = inputs.iter().map(|x| x.value).sum();
+        let planned_dbg: Vec<String> = inputs
+            .iter()
+            .map(|x| format!("{}@{}", x.outpoint, x.value))
+            .collect();
+        debug!(format!(
+            "bid.create_suppl planned_inputs={} planned_sum={}",
+            planned_dbg.join(","),
+            planned_sum
+        ));
+
+        // Track successfully inserted inputs and any misses
+        let mut inserted_sum: Sats = Sats::ZERO;
+        let mut inserted_set: HashSet<Outpoint> = HashSet::new();
+        let mut inserted_dbg: Vec<String> = vec![];
+        let mut missing_inputs: Vec<String> = vec![];
+
+        for input in &inputs {
+            let UtxoKit {
+                outpoint, value, ..
+            } = input.clone();
+            let prev_out =
+                Prevout::new(crate::rgb::compat::outpoint_bitcoin_to_bp(outpoint), value);
+
+            if let Some((_, spk)) = rgb_account
+                .wallet
+                .utxo(crate::rgb::compat::outpoint_bitcoin_to_bp(input.outpoint))
+            {
+                let new_psbt_input = psbt
+                    .construct_input(
+                        prev_out,
+                        rgb_wallet.descriptor(),
+                        input.terminal,
+                        spk,
+                        seqno,
+                    )
+                    .map_err(|_| OrderSupplError::WrongInput(format!("{outpoint}#{value}")))?;
+                new_psbt_input.sighash_type = Some(SighashType::none_anyone_can_pay());
+                inserted_sum += value;
+                inserted_set.insert(crate::rgb::compat::outpoint_bitcoin_to_bp(outpoint));
+                inserted_dbg.push(format!("rgb:{}@{}", outpoint, value));
+            } else if let Some((_, spk)) = btc_account
+                .wallet
+                .utxo(crate::rgb::compat::outpoint_bitcoin_to_bp(input.outpoint))
+            {
+                let new_psbt_input = psbt
+                    .construct_input(
+                        prev_out,
+                        btc_wallet.descriptor(),
+                        input.terminal,
+                        spk,
+                        seqno,
+                    )
+                    .map_err(|_| OrderSupplError::WrongInput(format!("{outpoint}#{value}")))?;
+                new_psbt_input.sighash_type = Some(SighashType::none_anyone_can_pay());
+                inserted_sum += value;
+                inserted_set.insert(crate::rgb::compat::outpoint_bitcoin_to_bp(outpoint));
+                inserted_dbg.push(format!("btc:{}@{}", outpoint, value));
+            } else {
+                // Neither wallet recognized the input outpoint
+                missing_inputs.push(format!("{}", outpoint));
+            }
+        }
+
+        debug!(format!(
+            "bid.create_suppl inserted_inputs_initial={} inserted_sum_initial={} missing_inputs={}",
+            inserted_dbg.join(","),
+            inserted_sum,
+            missing_inputs.join(",")
+        ));
+        {
+            // Inspect overlaps: which inserted inputs are also RGB-anchored
+            let inserted_vec: Vec<Outpoint> = inserted_set.iter().copied().collect();
+            if !inserted_vec.is_empty()
+                && let Ok(overlap_contracts) = rgb_stock.contracts_assigning(
+                    inserted_vec
+                        .iter()
+                        .copied()
+                        .map(crate::rgb::compat::outpoint_bp_to_bitcoin),
+                )
+            {
+                let ids: Vec<String> = overlap_contracts.map(|id| id.to_string()).collect();
+                debug!(format!(
+                    "bid.create_suppl overlap_contracts_on_inserted_inputs={}",
+                    ids.join(",")
+                ));
+            }
+        }
+
+        // Invoice (Process Pay)
+        let input_utxos: Vec<_> = self
+            .inputs()
+            .iter()
+            .map(|x| crate::rgb::compat::outpoint_bitcoin_to_bp(x.outpoint))
+            .collect();
+        let next_utxo = rgb_account
+            .wallet
+            .coinselect(Sats::ZERO, |utxo| {
+                crate::rgb::compat::rgb_keychain_contains(utxo.terminal.keychain)
+                    && !input_utxos.contains(&utxo.outpoint)
+            })
+            .next();
+
+        let seal_selection = if next_utxo.is_some() {
+            &RgbSelection::NextUTXO
+        } else {
+            &RgbSelection::NextAddress
+        };
+
+        let invoice_info = if let CounterParty::Contract(contract_swap) = self.counter_party() {
+            let ContractKit { info, .. } = contract_swap.kit.clone();
+            let invoice_amount = if info.contract_type().clone().is_uda() {
+                RgbInvoiceValue::UDA(UDAValue::default())
+            } else {
+                RgbInvoiceValue::Value(contract_swap.amount.to_string())
+            };
+
+            let invoice_req = RgbInvoiceRequest {
+                contract_id: Some(info.contract_id().to_string()),
+                amount: invoice_amount,
+                seal: seal_selection.clone(),
+                expire_at: None,
+            };
+
+            let options = RgbInvoiceOptions::default();
+            create_rgb_invoice(invoice_req, options, rgb_stock, rgb_account)
+                .map_err(|x| OrderSupplError::WrongBeneficiary(x.to_string()))?
+        } else {
+            return Err(OrderSupplError::WrongCounterParty);
+        };
+
+        let NewBidParams { chain_fee } = params;
+        let fee = match chain_fee {
+            ChainFee::Value(fee) => Sats::from_sats(fee),
+            _ => return Err(OrderSupplError::NoSupportFee),
+        };
+
+        // Ensure we have enough inserted inputs to cover required minimum: fee + optional offer price
+        let required_output = if self.is_sats() {
+            self.l1_amount()
+        } else {
+            Sats::ZERO
+        };
+        let required_min = required_output + fee;
+        if inserted_sum < required_min {
+            // Top up from BTC wallet across both keychains with mined UTXOs not already included
+            let bitcoin_keychains = [
+                AssetType::Bitcoin.to_keychain(),
+                AssetType::Bitcoin.to_alt_keychain(),
+            ];
+            let mut cand: Vec<_> = btc_wallet
+                .utxos()
+                .filter(|u| {
+                    matches!(u.status, bpwallet::TxStatus::Mined(_))
+                        && bitcoin_keychains.contains(&u.terminal.keychain)
+                        && !inserted_set.contains(&u.outpoint)
+                        && !inputs.iter().any(|x| {
+                            crate::rgb::compat::outpoint_bitcoin_to_bp(x.outpoint) == u.outpoint
+                        })
+                })
+                .collect();
+            // Prefer larger UTXOs first
+            cand.sort_by_key(|a| std::cmp::Reverse(a.value));
+
+            let mut topup_dbg: Vec<String> = vec![];
+            for u in cand {
+                if inserted_sum >= required_min {
+                    break;
+                }
+                // Retrieve full (WalletUtxo, ScriptPubkey) to get spk and terminal for construct_input
+                if let Ok((wu, spk)) = btc_account.wallet.outpoint_by(u.outpoint) {
+                    let prev_out = Prevout::new(wu.outpoint, wu.value);
+                    let new_psbt_input = psbt
+                        .construct_input(prev_out, btc_wallet.descriptor(), wu.terminal, spk, seqno)
+                        .map_err(|_| {
+                            OrderSupplError::WrongInput(format!("{}#{}", wu.outpoint, wu.value))
+                        })?;
+                    new_psbt_input.sighash_type = Some(SighashType::none_anyone_can_pay());
+                    inserted_set.insert(wu.outpoint);
+                    inserted_sum += wu.value;
+                    inserted_dbg.push(format!("topup-btc:{}@{}", wu.outpoint, wu.value));
+                    topup_dbg.push(format!("{}@{}", wu.outpoint, wu.value));
+                }
+            }
+
+            debug!(format!(
+                "bid.create_suppl topup_selected={} inserted_sum_after_topup={} required_min={}",
+                topup_dbg.join(","),
+                inserted_sum,
+                required_min
+            ));
+        }
+
+        // Use only actually inserted inputs for funding math
+        let sats: Sats = inserted_sum;
+        let mut sats_remaining = sats.checked_sub(fee).ok_or(OrderSupplError::Psbt(
+            ConstructionError::NoFundsForFee {
+                input_value: sats,
+                output_value: sats + fee,
+                fee,
+            }
+            .to_string(),
+        ))?;
+
+        if self.is_sats() {
+            let bitcoin_keychain = AssetType::Bitcoin.to_keychain();
+            let change_index = btc_wallet.last_derivation_index(bitcoin_keychain);
+            let change_terminal = Terminal::new(bitcoin_keychain, change_index);
+
+            let offer_price = self.l1_amount();
+            sats_remaining =
+                sats_remaining
+                    .checked_sub(offer_price)
+                    .ok_or(OrderSupplError::Psbt(
+                        ConstructionError::OutputExceedsInputs {
+                            input_value: sats_remaining,
+                            output_value: offer_price,
+                        }
+                        .to_string(),
+                    ))?;
+
+            if seal_selection.is_address() && sats_remaining.is_non_zero() {
+                let address = Address::from_str(&invoice_info.seal).expect("invalid secret_seal");
+                psbt.construct_output(address.script_pubkey(), sats_remaining)
+                    .map_err(|_| OrderSupplError::WrongOutput(format!("{address}")))?;
+            } else if sats_remaining.is_non_zero() {
+                psbt.construct_change(btc_wallet.descriptor(), change_terminal, sats_remaining)
+                    .map_err(|_| OrderSupplError::WrongChange(format!("{change_terminal}")))?;
+            } else {
+                return Err(OrderSupplError::NoContractOutpoint);
+            }
+        } else {
+            let rgb_keychain = AssetType::RGB20.to_keychain();
+            let change_index = btc_wallet.last_derivation_index(rgb_keychain);
+            let change_terminal = Terminal::new(rgb_keychain, change_index);
+            if seal_selection.is_address() && sats_remaining.is_non_zero() {
+                let address = Address::from_str(&invoice_info.seal).expect("invalid secret_seal");
+                psbt.construct_output(address.script_pubkey(), sats_remaining)
+                    .map_err(|_| OrderSupplError::WrongOutput(format!("{address}")))?;
+            } else if sats_remaining.is_non_zero() {
+                // Fix: BTC change must use the BTC wallet descriptor, not the RGB wallet descriptor
+                psbt.construct_change(btc_wallet.descriptor(), change_terminal, sats_remaining)
+                    .map_err(|_| OrderSupplError::WrongChange(format!("{change_terminal}")))?;
+            } else {
+                return Err(OrderSupplError::NoContractOutpoint);
+            }
+        }
+
+        // ::: Create Suppl :::
+        let mut suppl = match self.asset() {
+            BidAsset::L1(_) => OrderSuppl::l1(psbt),
+            BidAsset::Contract(contract_swap) => {
+                let contract_id = contract_swap.contract_id();
+
+                let prev_outputs = psbt
+                    .to_unsigned_tx()
+                    .inputs
+                    .iter()
+                    .map(|txin| txin.prev_output)
+                    .collect::<HashSet<Outpoint>>();
+
+                let mut asset_available_amt = 0;
+                let mut contract_inputs = BTreeMap::new();
+
+                let mut allocation = bmap! {};
+
+                for (output_seal, opout_state_map) in rgb_stock
+                    .contract_assignments_for(
+                        contract_id,
+                        prev_outputs
+                            .iter()
+                            .filter(|op| {
+                                inputs.iter().any(|x| {
+                                    crate::rgb::compat::outpoint_bitcoin_to_bp(x.outpoint) == **op
+                                })
+                            })
+                            .copied()
+                            .map(crate::rgb::compat::outpoint_bp_to_bitcoin),
+                    )
+                    .unwrap()
+                {
+                    for (opout, state) in opout_state_map {
+                        if let AllocatedState::Amount(amt) = &state {
+                            asset_available_amt += amt.as_u64();
+                        }
+
+                        allocation.insert(output_seal.to_outpoint(), contract_id);
+                        contract_inputs.insert(opout, state.clone());
+                    }
+                }
+
+                let (vout_index, _) = psbt
+                    .to_unsigned_tx()
+                    .outputs
+                    .iter()
+                    .enumerate()
+                    .find(|(_, o)| o.script_pubkey.is_p2tr())
+                    .expect("psbt should have an taproot output");
+
+                let (_, tapret_output) = psbt
+                    .outputs_mut()
+                    .enumerate()
+                    .find(|(i, _)| i == &vout_index)
+                    .unwrap();
+                let _ = tapret_output.set_tapret_host();
+
+                for (output, contract_id) in &allocation {
+                    if let Some(input) = psbt.inputs_mut().find(|x| {
+                        x.previous_outpoint == crate::rgb::compat::outpoint_bitcoin_to_bp(*output)
+                    }) {
+                        let amount = self.amount().to_value();
+                        let allocated = if asset_available_amt > 0 && amount < asset_available_amt {
+                            asset_available_amt - amount
+                        } else {
+                            0
+                        };
+
+                        input.set_rgb_bid_in(*contract_id, allocated).unwrap();
+                    }
+                }
+
+                // Retrieve all bundles
+                let stash = rgb_stock.as_stash_provider().clone_no_persistence();
+                let index = rgb_stock.as_index_provider().clone_no_persistence();
+
+                #[allow(clippy::expect_used)]
+                let mut current_opouts = index
+                    .public_opouts(contract_id)
+                    .expect("Infallible index read");
+
+                #[allow(clippy::expect_used)]
+                let outputs = allocation.into_keys();
+                current_opouts.extend(
+                    index
+                        .opouts_by_outputs(contract_id, outputs)
+                        .expect("Infallible index read"),
+                );
+
+                let mut anchors = bmap! {};
+                let mut previous_opouts = vec![];
+                for opout in current_opouts {
+                    if previous_opouts.contains(&opout) {
+                        continue;
+                    }
+                    if let Ok(bundle_id) = index.bundle_id_for_op(opout.op) {
+                        if let Ok(bundle) = stash.bundle(bundle_id) {
+                            let transitions = bundle
+                                .known_transitions
+                                .iter()
+                                .filter(|known| known.opid == opout.op)
+                                .map(|known| known.transition.clone());
+
+                            transitions.for_each(|transition| {
+                                transition
+                                    .assignments
+                                    .iter()
+                                    .find(|(ty, _)| *ty == &opout.ty)
+                                    .map(|(_, assignments)| assignments)
+                                    .iter()
+                                    .for_each(|x| {
+                                        let mut seals_reveled = vec![];
+                                        let count = x.len_u16();
+                                        for index in 0..count {
+                                            if let Ok(Some(reveal)) = x.revealed_seal_at(index) {
+                                                seals_reveled.push(reveal);
+                                            }
+                                        }
+
+                                        #[allow(clippy::expect_used)]
+                                        let (witness_ids, _) = index
+                                            .bundle_info(bundle_id)
+                                            .expect("Infallible index read");
+
+                                        for witness_id in witness_ids {
+                                            #[allow(clippy::expect_used)]
+                                            let witness_seal = stash
+                                                .witness(witness_id)
+                                                .expect("Infallible stash provider");
+
+                                            anchors.insert(
+                                                witness_seal.witness_id(),
+                                                AnchorShard::new(
+                                                    witness_seal.clone(),
+                                                    bundle.clone(),
+                                                ),
+                                            );
+                                        }
+                                    });
+                            });
+                        }
+                        previous_opouts.push(opout);
+                    }
+                }
+
+                // Prepare other transition
+                let mut extra_state = HashMap::<
+                    ContractId,
+                    HashMap<OutputSeal, HashMap<Opout, AllocatedState>>,
+                >::new();
+
+                for id in rgb_stock
+                    .contracts_assigning(
+                        prev_outputs
+                            .iter()
+                            .filter(|op| {
+                                inputs.iter().any(|x| {
+                                    crate::rgb::compat::outpoint_bitcoin_to_bp(x.outpoint) == **op
+                                })
+                            })
+                            .copied()
+                            .map(crate::rgb::compat::outpoint_bp_to_bitcoin),
+                    )
+                    .unwrap()
+                {
+                    // Skip current contract
+                    if id == contract_id {
+                        continue;
+                    }
+
+                    let state = rgb_stock
+                        .contract_assignments_for(
+                            id,
+                            prev_outputs
+                                .iter()
+                                .copied()
+                                .map(crate::rgb::compat::outpoint_bp_to_bitcoin),
+                        )
+                        .map_err(|e| OrderSupplError::WrongBlank(e.to_string()))?;
+
+                    // FIX: Skip contracts with no allocations on the UTXOs being spent
+                    // contracts_assigning() returns contracts based on index/witness references,
+                    // but they may not have actual OUTPUT allocations on these specific UTXOs
+                    if state.is_empty() {
+                        debug!(format!(
+                            "bid.extras.skip_empty contract_id={} reason=no_allocations_on_spent_utxos",
+                            id
+                        ));
+                        continue;
+                    }
+
+                    let entry = extra_state.entry(id).or_default();
+                    for (seal, assigns) in state {
+                        entry.entry(seal).or_default().extend(assigns);
+                    }
+                }
+
+                let mut extra_contracts = vec![];
+                for (contract_id, contract_states) in extra_state {
+                    let mut states: BTreeMap<Opout, AllocatedState> = BTreeMap::new();
+                    for (output_seal, contract_state) in contract_states {
+                        if let Some(input) = psbt.inputs_mut().find(|x| {
+                            x.previous_outpoint
+                                == crate::rgb::compat::outpoint_bitcoin_to_bp(
+                                    output_seal.to_outpoint(),
+                                )
+                        }) {
+                            let mut allocated = 0;
+                            for (opout, state) in contract_state.clone() {
+                                match state {
+                                    AllocatedState::Void => {}
+                                    AllocatedState::Amount(amount) => {
+                                        allocated += amount.as_u64();
+                                    }
+                                    AllocatedState::Data(_) => {
+                                        allocated = 1;
+                                    }
+                                }
+                                states.insert(opout, state);
+                            }
+
+                            // input.set_rgb_offer_in(contract_id, allocated).unwrap();
+                            input.set_rgb_bid_in(contract_id, allocated).unwrap();
+                        }
+                    }
+
+                    let contract_exported = rgb_stock
+                        .export_contract(contract_id)
+                        .expect("no contract exported");
+
+                    // Collect anchors by iterating through the states (opouts) that are part of this swap
+                    let mut extra_anchors: BTreeMap<rgbcore::Txid, AnchorShard> = BTreeMap::new();
+                    let stash = rgb_stock.as_stash_provider().clone_no_persistence();
+                    let index = rgb_stock.as_index_provider().clone_no_persistence();
+
+                    debug!(format!(
+                        "bid.extra_anchor.start contract_id={} states_count={}",
+                        contract_id,
+                        states.len()
+                    ));
+
+                    for opout in states.keys() {
+                        // Get the bundle that created this opout
+                        if let Ok(bundle_id) = index.bundle_id_for_op(opout.op)
+                            && let Ok(bundle) = stash.bundle(bundle_id)
+                            && let Ok((witness_ids, _)) = index.bundle_info(bundle_id)
+                        {
+                            for witness_id in witness_ids {
+                                if let Ok(witness_seal) = stash.witness(witness_id) {
+                                    extra_anchors.insert(
+                                        witness_seal.witness_id(),
+                                        AnchorShard::new(witness_seal.clone(), bundle.clone()),
+                                    );
+                                    debug!(format!(
+                                        "bid.extra_anchor.collected contract_id={} witness_id={}",
+                                        contract_id,
+                                        witness_seal.witness_id()
+                                    ));
+                                }
+                            }
+                        }
+                    }
+
+                    debug!(format!(
+                        "bid.extra_anchor.finish contract_id={} anchors_count={}",
+                        contract_id,
+                        extra_anchors.len()
+                    ));
+
+                    let rgb_shard =
+                        RgbExtraShard::new(contract_id, contract_exported, states, extra_anchors);
+                    extra_contracts.push(rgb_shard);
+                }
+
+                // Note: Early pending_host registration for historical witness outpoints removed.
+                // Historical outpoints are already known to wallet via indexing.
+                // Swap outputs are registered during verification (rgb.rs:647-685).
+
+                OrderSuppl::rgb(contract_inputs, anchors, extra_contracts, psbt)
+            }
+        };
+
+        suppl.add_invoice(invoice_info.invoice);
+        self.add_suppl(suppl.clone());
+
+        Ok(suppl)
+    }
+}
+
+#[derive(Debug, Display, From, Error)]
+#[display(doc_comments)]
+pub enum SwapErrors {
+    /// I/O or connectivity error. {0}
+    IO(CrossStoreError),
+    /// store retrieve error. {0}
+    Store(String),
+    /// explorer sync error. {0}
+    Explorer(String),
+    /// rgb contract iface error. {0}
+    ContractIfaceError(String, String),
+    /// rgb contract error. {0}
+    ContractError(#[from] ContractError),
+    /// strict encoding error. {0}
+    StrictEncodingError(#[from] strict_encoding::InvalidRString),
+    /// invalid partial psbt.
+    WrongPsbt(String),
+    /// invalid offer
+    WrongOffer,
+    /// invalid bid
+    WrongBid,
+    /// invalid invoice. {0}
+    InvalidInvoice(String),
+    /// no commit output
+    NoOutput,
+    /// no tapret output
+    NoTapret,
+    /// rgb transfer error. {0}
+    Transfer(String),
+    /// rgb pay error. {0}
+    Pay(String),
+    /// rgb contract shard error. {0}
+    Shard(ShardErrors),
+    /// rgb embed error. {0}
+    Embed(EmbedError),
+    /// rgb completion error
+    CompletionError(#[from] CompletionError),
+    /// rgb commit error. {0}
+    CommitError(#[from] psrgbt::CommitError),
+}
+
+impl PublicRgbOffer {
+    pub(crate) fn swap(
+        self,
+        chain_net: ChainNet,
+        public_bid: PublicRgbBid,
+        rgb_stock: &mut RGBStock,
+        rgb_resolver: &mut BitmaskResolver,
+    ) -> Result<SwapSupplement, SwapErrors> {
+        // 1. Merge PSBT
+        let PublicRgbOffer {
+            order_suppl: offer_suppl,
+            ..
+        } = self;
+
+        let PublicRgbBid {
+            suppl: bid_suppl,
+            asset: bid_asset,
+            amount: bid_amount,
+            ..
+        } = public_bid.clone();
+
+        let offer_suppl = offer_suppl.unwrap();
+        let bid_suppl = bid_suppl.unwrap();
+
+        let seller_psbt = offer_suppl.psbt.clone();
+        let seller_shard = offer_suppl.shard;
+        let seller_extra_shard = offer_suppl.extra;
+
+        let buyer_psbt = bid_suppl.psbt.clone();
+        let buyer_invoice = bid_suppl.beneficiary.clone().unwrap_or_default();
+        let buyer_shard = bid_suppl.shard;
+        let buyer_extra_shard = bid_suppl.extra;
+
+        let rgb_invoice = RgbInvoice::from_str(&buyer_invoice)
+            .map_err(|_| SwapErrors::InvalidInvoice(buyer_invoice.to_string()))?;
+
+        let offer_psbt = Psbt::from_base64(&seller_psbt).map_err(|_| SwapErrors::WrongOffer)?;
+        let bid_psbt = Psbt::from_base64(&buyer_psbt).map_err(|_| SwapErrors::WrongBid)?;
+
+        let mut offer_inputs: Vec<_> = offer_psbt.inputs().collect();
+        let mut offer_outputs: Vec<_> = offer_psbt.outputs().collect();
+
+        let mut bids_inputs: Vec<_> = bid_psbt.inputs().collect();
+        let mut bids_outputs: Vec<_> = bid_psbt.outputs().collect();
+
+        let mut swap_inputs = if bids_inputs.is_empty() {
+            vec![offer_inputs.remove(0)]
+        } else {
+            vec![bids_inputs.remove(0), offer_inputs.remove(0)]
+        };
+
+        let mut swap_outputs = if offer_outputs.len() <= 1 {
+            vec![offer_outputs.remove(0)]
+        } else {
+            vec![offer_outputs.remove(0), offer_outputs.remove(0)]
+        };
+
+        if bids_outputs.len() > 1 {
+            bids_outputs.remove(0); // Discard redundancy
+        }
+
+        offer_inputs.extend(bids_inputs);
+        for input in offer_inputs {
+            swap_inputs.push(input);
+        }
+
+        offer_outputs.extend(bids_outputs);
+        for output in offer_outputs {
+            swap_outputs.push(output);
+        }
+
+        // 2. Create PSBT Swap. Dummy ins/outs are cloned over from the merged
+        // offer/bid PSBT pieces; do not use rgb-strict-encoding StrictDumb on
+        // bp-std types (those implement strict_encoding 2.8.2).
+        let dummy_in = TxIn {
+            prev_output: Outpoint::new(bpstd::Txid::from([0u8; 32]), Vout::from_u32(0)),
+            sig_script: default!(),
+            sequence: SeqNo::from_consensus_u32(0),
+            witness: none!(),
+        };
+        let dummy_out = TxOut::new(bpstd::ScriptPubkey::op_return(&[]), Sats::ZERO);
+        let mut swap_tx_tmpl = Tx {
+            version: default!(),
+            inputs: empty!(),
+            outputs: empty!(),
+            lock_time: none!(),
+        };
+        swap_tx_tmpl.inputs.clear();
+        swap_tx_tmpl.outputs.clear();
+
+        for _ in 0..swap_inputs.len() {
+            swap_tx_tmpl
+                .inputs
+                .push(dummy_in.clone())
+                .expect("invalid input size");
+        }
+        for _ in 0..swap_outputs.len() {
+            swap_tx_tmpl
+                .outputs
+                .push(dummy_out.clone())
+                .expect("invalid output size");
+        }
+
+        let mut swap_psbt = Psbt::from_tx(swap_tx_tmpl);
+        for (index, input) in swap_psbt.inputs_mut().enumerate() {
+            input.clone_from(swap_inputs[index]);
+        }
+        for (index, output) in swap_psbt.outputs_mut().enumerate() {
+            output.clone_from(swap_outputs[index]);
+        }
+
+        swap_psbt.proprietary.extend(offer_psbt.proprietary.clone());
+        swap_psbt.proprietary.extend(bid_psbt.proprietary.clone());
+
+        // 4. Generate RGB Commit
+        // Prefer the seller's strong host binding (scriptPubKey), then persisted host terminal; fall back to first P2TR output.
+        let mut host_set = false;
+
+        // A) Enforce scriptPubKey host binding if present
+        if let Some(ref spk_hex) = offer_suppl.seller_host_spk {
+            if let Ok(spk_bytes) = Vec::<u8>::from_hex(spk_hex) {
+                if let Some((vout_index, _)) = swap_psbt
+                    .to_unsigned_tx()
+                    .outputs
+                    .iter()
+                    .enumerate()
+                    .find(|(_, o)| o.script_pubkey.as_slice() == spk_bytes.as_slice())
+                {
+                    let _ = swap_psbt
+                        .output_mut(vout_index)
+                        .ok_or(SwapErrors::NoOutput)?
+                        .set_tapret_host();
+                    host_set = true;
+                } else {
+                    return Err(SwapErrors::WrongPsbt(
+                        "Host binding violated (seller host script not found in merged PSBT)"
+                            .to_string(),
+                    ));
+                }
+            } else {
+                return Err(SwapErrors::WrongPsbt(
+                    "Host binding decode error".to_string(),
+                ));
+            }
+        }
+
+        // B) If no binding, use persisted host terminal (keychain/index)
+        if !host_set && let Some(host) = offer_suppl.seller_host_terminal.clone() {
+            for out in swap_psbt.outputs_mut() {
+                if let Some(der) = out.terminal_derivation()
+                    && der.keychain == host.keychain
+                    && der.index == host.index
+                {
+                    let _ = out.set_tapret_host();
+                    host_set = true;
+                    break;
+                }
+            }
+        }
+        if !host_set {
+            return Err(SwapErrors::WrongPsbt(
+                "No seller host found in merged PSBT (binding and persisted terminal missing)"
+                    .to_string(),
+            ));
+        }
+
+        swap_psbt.set_rgb_close_method(CloseMethod::TapretFirst);
+
+        let seller_extra_shards = if let Some(serialized) = seller_extra_shard {
+            let serialized = Vec::<u8>::from_ascii_armored_str(&serialized)
+                .map_err(|err| SwapErrors::Shard(ShardErrors::Parse(err.to_string())))?;
+            let confined = Confined::from_slice_checked(serialized.as_slice());
+
+            let rgb_shards = RgbExtraShards::from_strict_serialized::<U16>(confined)
+                .map_err(|err| SwapErrors::Shard(ShardErrors::Parse(err.to_string())))?;
+            rgb_shards.extras.to_vec()
+        } else {
+            vec![]
+        };
+
+        let buyer_extra_shards = if let Some(serialized) = buyer_extra_shard {
+            let serialized = Vec::<u8>::from_ascii_armored_str(&serialized)
+                .map_err(|err| SwapErrors::Shard(ShardErrors::Parse(err.to_string())))?;
+            let confined = Confined::from_slice_checked(serialized.as_slice());
+
+            let rgb_shards = RgbExtraShards::from_strict_serialized::<U16>(confined)
+                .map_err(|err| SwapErrors::Shard(ShardErrors::Parse(err.to_string())))?;
+            rgb_shards.extras.to_vec()
+        } else {
+            vec![]
+        };
+
+        let bid_seal = if let Some(serialized) = seller_shard {
+            let serialized = Vec::<u8>::from_ascii_armored_str(&serialized)
+                .map_err(|err| SwapErrors::Shard(ShardErrors::Parse(err.to_string())))?;
+            let confined = Confined::from_slice_checked(serialized.as_slice());
+
+            let rgb_shard = RgbShard::from_strict_serialized::<U16>(confined)
+                .map_err(|err| SwapErrors::Shard(ShardErrors::Parse(err.to_string())))?;
+
+            swap_psbt
+                .pay_buyer(rgb_invoice.clone(), rgb_shard, rgb_stock)
+                .map_err(|x| SwapErrors::Pay(x.to_string()))?
+        } else {
+            match rgb_invoice.beneficiary.into_inner() {
+                Beneficiary::BlindedSeal(seal) => seal,
+                Beneficiary::WitnessVout(addr, _) => {
+                    let s = crate::rgb::compat::script_pubkey_bp_from_pay2vout(addr);
+                    let vout = swap_psbt
+                        .outputs()
+                        .position(|output| output.script == s)
+                        .ok_or(CompletionError::NoBeneficiaryOutput)
+                        .expect("rgb swap");
+                    let vout = Vout::from_u32(vout as u32);
+
+                    let seal = GraphSeal::new_random_vout(crate::rgb::compat::vout_bp_to_rgb(vout));
+                    rgb_stock.store_secret_seal(seal).expect("rgb swap");
+                    seal.to_secret_seal()
+                }
+            }
+        };
+
+        let offer_seal = SecretSeal::from_str(&offer_suppl.beneficiary.unwrap_or_default())
+            .expect("invalid secret seal");
+        if let Some(serialized) = buyer_shard {
+            let serialized = Vec::<u8>::from_ascii_armored_str(&serialized)
+                .map_err(|err| SwapErrors::Shard(ShardErrors::Parse(err.to_string())))?;
+            let confined = Confined::from_slice_checked(serialized.as_slice());
+
+            let rgb_shard = RgbShard::from_strict_serialized::<U16>(confined)
+                .map_err(|err| SwapErrors::Shard(ShardErrors::Parse(err.to_string())))?;
+
+            if let AssetKit::Contract(bid_kit) = bid_asset.clone() {
+                swap_psbt
+                    .pay_seller(offer_seal, bid_kit, bid_amount, rgb_shard, rgb_stock)
+                    .map_err(|x| SwapErrors::Pay(x.to_string()))?;
+            }
+        }
+
+        swap_psbt
+            .add_extra_seller(
+                chain_net,
+                seller_extra_shards.clone(),
+                rgb_stock,
+                rgb_resolver,
+            )
+            .expect("rgb swap");
+        swap_psbt
+            .add_extra_buyer(
+                chain_net,
+                buyer_extra_shards.clone(),
+                rgb_stock,
+                rgb_resolver,
+            )
+            .expect("rgb swap");
+
+        swap_psbt.complete_construction();
+
+        // 5. Generate Transfer
+        let contract_id = rgb_invoice.contract.ok_or(CompletionError::NoContract)?;
+
+        // Diagnostic: Check which contracts are registered in PSBT before rgb_commit
+        match swap_psbt.rgb_contract_ids() {
+            Ok(contract_ids) => {
+                debug!(format!(
+                    "swap.before_commit.rgb_contract_ids count={} ids=[{}]",
+                    contract_ids.len(),
+                    contract_ids
+                        .iter()
+                        .map(|id| id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+
+                if !contract_ids.contains(&contract_id) {
+                    debug!(format!(
+                        "swap.before_commit.ERROR main_contract={} NOT_FOUND_IN_PSBT",
+                        contract_id
+                    ));
+                }
+
+                for cid in contract_ids {
+                    if let Ok(consumers) = swap_psbt.rgb_contract_consumers(cid) {
+                        debug!(format!(
+                            "swap.before_commit.consumers contract={} count={} is_main={}",
+                            cid,
+                            consumers.len(),
+                            cid == contract_id
+                        ));
+                    }
+                }
+            }
+            Err(e) => {
+                debug!(format!(
+                    "swap.before_commit.rgb_contract_ids.ERROR error={:?}",
+                    e
+                ));
+            }
+        }
+
+        let fascia = swap_psbt.rgb_commit()?;
+
+        // Diagnostic: Check what contracts are actually in the committed fascia
+        debug!(format!(
+            "swap.after_commit.fascia bundles_count={} witness_txid={}",
+            fascia.bundles().len(),
+            fascia.seal_witness().witness_id()
+        ));
+
+        let bundle_contract_ids: Vec<String> =
+            fascia.bundles().keys().map(|id| id.to_string()).collect();
+
+        debug!(format!(
+            "swap.after_commit.fascia.contracts contracts=[{}]",
+            bundle_contract_ids.join(", ")
+        ));
+
+        // Check if the main contract and extras are all present in the fascia
+        if !fascia.bundles().contains_key(&contract_id) {
+            debug!(format!(
+                "swap.after_commit.fascia.ERROR main_contract={} NOT_IN_FASCIA",
+                contract_id
+            ));
+        }
+
+        for extra_shard in seller_extra_shards.iter().chain(buyer_extra_shards.iter()) {
+            let extra_contract_id = extra_shard.contract_id;
+            if !fascia.bundles().contains_key(&extra_contract_id) {
+                debug!(format!(
+                    "swap.after_commit.fascia.ERROR extra_contract={} NOT_IN_FASCIA",
+                    extra_contract_id
+                ));
+            } else {
+                debug!(format!(
+                    "swap.after_commit.fascia.extra_present contract={}",
+                    extra_contract_id
+                ));
+            }
+        }
+
+        // CRITICAL DIAGNOSTIC: Check which bundle IDs are actually in the tapret merkle block
+        let known_bundle_ids: Vec<String> = fascia
+            .seal_witness()
+            .known_bundle_ids()
+            .map(|id| id.to_string())
+            .collect();
+
+        debug!(format!(
+            "swap.after_commit.merkle_block.known_bundles count={} bundles=[{}]",
+            known_bundle_ids.len(),
+            known_bundle_ids.join(", ")
+        ));
+
+        // Map bundle IDs back to contract IDs to see which contracts are in tapret commitment
+        for (cid, bundle) in fascia.bundles().iter() {
+            let bundle_id = bundle.bundle_id();
+            let in_merkle_block = fascia
+                .seal_witness()
+                .known_bundle_ids()
+                .any(|bid| bid == bundle_id);
+            debug!(format!(
+                "swap.after_commit.contract_in_merkle contract={} bundle={} in_tapret={}",
+                cid, bundle_id, in_merkle_block
+            ));
+        }
+
+        let witness_txid = swap_psbt.txid();
+        let beneficiary1 = vec![bid_seal];
+        let beneficiary2 = vec![];
+
+        let mut transfers = bmap! {};
+        rgb_stock
+            .consume_fascia(fascia.clone(), TentativeWitness::from_bp(witness_txid))
+            .expect("invalid fascia");
+
+        let rgb_transfer = rgb_stock
+            .transfer(
+                contract_id,
+                beneficiary2.clone(),
+                beneficiary1.clone(),
+                [],
+                Some(crate::rgb::compat::txid_bp_to_bitcoin(witness_txid)),
+            )
+            .map_err(|e| SwapErrors::Pay(e.to_string()))?;
+
+        transfers.insert(rgb_transfer.consignment_id(), format!("{rgb_transfer}"));
+        if let AssetKit::Contract(bid_kit) = bid_asset {
+            let beneficiary1 = vec![offer_seal];
+            let beneficiary2 = vec![];
+
+            let rgb_transfer = rgb_stock
+                .transfer(
+                    *bid_kit.info.contract_id(),
+                    beneficiary2,
+                    beneficiary1,
+                    [],
+                    Some(crate::rgb::compat::txid_bp_to_bitcoin(witness_txid)),
+                )
+                .map_err(|e| SwapErrors::Pay(e.to_string()))?;
+            transfers.insert(rgb_transfer.consignment_id(), format!("{rgb_transfer}"));
+        }
+
+        // 6. Collect anchors for extras from the serialized RgbExtraShard anchors field
+        let mut extras_anchors: BTreeMap<ContractId, BTreeMap<rgbcore::Txid, AnchorShard>> =
+            BTreeMap::new();
+
+        // Collect seller extras anchors
+        // Note: Anchors were collected during offer creation and serialized in RgbExtraShard
+        for extra_shard in seller_extra_shards {
+            let contract_id = extra_shard.contract_id;
+            let anchors = extra_shard.anchors.to_unconfined();
+
+            crate::debug!(format!(
+                "swap.extras_anchors.seller contract_id={} anchors_count={}",
+                contract_id,
+                anchors.len()
+            ));
+
+            if !anchors.is_empty() {
+                extras_anchors.insert(contract_id, anchors.clone());
+                for witness_id in anchors.keys() {
+                    crate::debug!(format!(
+                        "swap.extras_anchors.collected seller contract_id={} witness_id={}",
+                        contract_id, witness_id
+                    ));
+                }
+            }
+        }
+
+        // Collect buyer extras anchors
+        // Note: Anchors were collected during bid creation and serialized in RgbExtraShard
+        for extra_shard in buyer_extra_shards {
+            let contract_id = extra_shard.contract_id;
+            let anchors = extra_shard.anchors.to_unconfined();
+
+            crate::debug!(format!(
+                "swap.extras_anchors.buyer contract_id={} anchors_count={}",
+                contract_id,
+                anchors.len()
+            ));
+
+            if !anchors.is_empty() {
+                extras_anchors.insert(contract_id, anchors.clone());
+                for witness_id in anchors.keys() {
+                    crate::debug!(format!(
+                        "swap.extras_anchors.collected buyer contract_id={} witness_id={}",
+                        contract_id, witness_id
+                    ));
+                }
+            }
+        }
+
+        // 7. Generate Rgb Swap
+        let tapret = swap_psbt.export_commit().expect("invalid tapret");
+
+        // Serialize the fascia for use during verification
+        let fascia_serialized = fascia
+            .to_strict_serialized::<U16>()
+            .ok()
+            .map(|bytes| bytes.to_ascii_armored_string());
+
+        let swap_suppl = SwapSupplement {
+            tapret: tapret.to_string(),
+            psbt: swap_psbt.to_base64_ver(PsbtVer::V0),
+            transfers,
+            extras_anchors,
+            fascia: fascia_serialized,
+        };
+
+        // 8. Sync Provider
+
+        Ok(swap_suppl)
+    }
 }

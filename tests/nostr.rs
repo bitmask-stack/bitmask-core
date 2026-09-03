@@ -3,7 +3,7 @@
 use anyhow::{Ok, Result};
 use bitmask_core::{
     info,
-    lightning::{auth, create_wallet, AuthResponse, CreateWalletResponse},
+    lightning::{AuthResponse, CreateWalletResponse, auth, create_wallet},
     nostr::{new_nostr_pubkey, update_nostr_pubkey},
     util::init_logging,
 };
@@ -32,10 +32,8 @@ pub async fn new_nostr_pubkey_test() -> Result<()> {
     let alice_response = auth(&alice, &alice).await?;
     thread::sleep(Duration::from_secs(1));
 
-    use nostr_sdk::prelude::*;
-
     // Generate new nostr keys
-    let keys: Keys = Keys::generate();
+    let keys = nostr::Keys::generate();
     let pubkey = keys.public_key().to_string();
 
     if let AuthResponse::Result { refresh: _, token } = alice_response {
@@ -58,10 +56,8 @@ pub async fn update_nostr_pubkey_test() -> Result<()> {
     let alice_response = auth(&alice, &alice).await?;
     thread::sleep(Duration::from_secs(1));
 
-    use nostr_sdk::prelude::*;
-
     // Generate new nostr keys
-    let keys: Keys = Keys::generate();
+    let keys = nostr::Keys::generate();
     let pubkey = keys.public_key().to_string();
 
     if let AuthResponse::Result { refresh: _, token } = alice_response {
@@ -69,7 +65,7 @@ pub async fn update_nostr_pubkey_test() -> Result<()> {
         assert_eq!(response.status, "ok".to_string());
         // Update the nostr pubkey
         // Generate newer nostr keys
-        let keys: Keys = Keys::generate();
+        let keys = nostr::Keys::generate();
         let pubkey = keys.public_key().to_string();
         let response = update_nostr_pubkey(&pubkey, &token).await?;
         assert_eq!(response.status, "ok".to_string());

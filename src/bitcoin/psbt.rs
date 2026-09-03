@@ -1,47 +1,105 @@
-use bdk::{blockchain::Blockchain, psbt::PsbtUtils, SignOptions, TransactionDetails};
-use bitcoin::{consensus::serialize, hashes::hex::ToHex, util::psbt::PartiallySignedTransaction};
+use crate::{
+    bitcoin::{MemoryWallet, get_blockchain},
+    debug, info,
+    structs::TransactionDetails,
+};
+use bdk_wallet::SignOptions;
+use bitcoin::{consensus::serialize, psbt::Psbt};
 use thiserror::Error;
 
-use crate::{
-    bitcoin::{get_blockchain, MemoryWallet},
-    debug,
-};
-
+#[allow(clippy::result_large_err)] // PSBT + esplora error graph; do not reshape
 #[derive(Error, Debug)]
 pub enum BitcoinPsbtError {
     /// Could not broadcast PSBT
-    #[error("Could not broadcast PSBT")]
+    #[error("Could not broadcast PSBT. {0}")]
     CouldNotBroadcastPsbt(String),
     /// Could not finalize when signing PSBT
     #[error("Could not finalize when signing PSBT")]
     CouldNotFinalizePsbt,
-    /// BDK error
-    #[error(transparent)]
-    BdkError(#[from] bdk::Error),
+    /// BDK signer error
+    #[error("BDK sign: {0}")]
+    BdkSignError(String),
     /// BDK esplora error
     #[error(transparent)]
-    BdkEsploraError(#[from] bdk::esplora_client::Error),
+    BdkIndexerError(#[from] bdk_esplora::esplora_client::Error),
+    /// BDK wallet error
+    #[error(transparent)]
+    BitcoinWalletError(#[from] crate::bitcoin::BitcoinWalletError),
+    /// RGB/BP esplora (bp-esplora crate name `esplora`)
+    #[error(transparent)]
+    Esplora(#[from] esplora::Error),
+    #[error("No fee in PSBT present")]
+    NoFeeInPsbt,
+    #[error("PSBT extract tx: {0}")]
+    ExtractTx(String),
 }
 
-// Only signs an original psbt.
-pub async fn sign_psbt(
-    wallet: &MemoryWallet,
-    mut psbt: PartiallySignedTransaction,
-) -> Result<PartiallySignedTransaction, BitcoinPsbtError> {
-    debug!("Funding PSBT...");
-    let opts = SignOptions {
+fn sign_opts() -> SignOptions {
+    SignOptions {
         allow_all_sighashes: true,
-        remove_partial_sigs: false,
         ..Default::default()
-    };
-    wallet.lock().await.sign(&mut psbt, opts)?;
+    }
+}
+
+fn psbt_fee_sats(psbt: &Psbt) -> Result<u64, BitcoinPsbtError> {
+    psbt.fee()
+        .map(|a| a.to_sat())
+        .map_err(|_| BitcoinPsbtError::NoFeeInPsbt)
+}
+
+fn extract_tx(psbt: Psbt) -> Result<bitcoin::Transaction, BitcoinPsbtError> {
+    psbt.extract_tx()
+        .map_err(|e| BitcoinPsbtError::ExtractTx(e.to_string()))
+}
+
+fn tx_hex(tx: &bitcoin::Transaction) -> String {
+    serialize(tx).iter().fold(String::new(), |mut s, b| {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+fn details_from_broadcast_tx(
+    tx: Option<bitcoin::Transaction>,
+    txid: bitcoin::Txid,
+    fee_amount: u64,
+) -> TransactionDetails {
+    let mut sent = 0;
+    let mut received = 0;
+
+    if let Some(ref transaction) = tx {
+        sent = transaction
+            .output
+            .iter()
+            .fold(0, |sum, output| output.value.to_sat() + sum);
+        received = sent.saturating_sub(fee_amount);
+    }
+
+    TransactionDetails {
+        transaction: tx,
+        txid,
+        received,
+        sent,
+        fee: Some(fee_amount),
+        confirmation_time: None,
+    }
+}
+
+pub async fn sign_psbt(wallet: &MemoryWallet, mut psbt: Psbt) -> Result<Psbt, BitcoinPsbtError> {
+    debug!("Funding PSBT...");
+    wallet
+        .lock()
+        .await
+        .sign(&mut psbt, sign_opts())
+        .map_err(|e| BitcoinPsbtError::BdkSignError(e.to_string()))?;
     Ok(psbt)
 }
 
 pub async fn multi_sign_psbt(
     wallets: Vec<MemoryWallet>,
-    mut psbt: PartiallySignedTransaction,
-) -> Result<PartiallySignedTransaction, BitcoinPsbtError> {
+    mut psbt: Psbt,
+) -> Result<Psbt, BitcoinPsbtError> {
     let total_wallets = wallets.len();
     debug!(format!(
         "Signing PSBT ({total_wallets}/{total_wallets}) ..."
@@ -49,14 +107,10 @@ pub async fn multi_sign_psbt(
 
     let mut sign_count = 0;
     for wallet in wallets {
-        let sign = wallet.lock().await.sign(
-            &mut psbt,
-            SignOptions {
-                allow_all_sighashes: true,
-                remove_partial_sigs: false,
-                ..Default::default()
-            },
-        )?;
+        let current_wallet = wallet.lock().await;
+        let sign = current_wallet
+            .sign(&mut psbt, sign_opts())
+            .map_err(|e| BitcoinPsbtError::BdkSignError(e.to_string()))?;
 
         if sign {
             sign_count += 1;
@@ -68,82 +122,55 @@ pub async fn multi_sign_psbt(
     Ok(psbt)
 }
 
-pub async fn publish_psbt(
-    psbt: PartiallySignedTransaction,
-) -> Result<TransactionDetails, BitcoinPsbtError> {
-    debug!("Signed PSBT:", base64::encode(&serialize(&psbt)));
-    let fee_amount = psbt.fee_amount().expect("fee amount on PSBT is known");
-    let tx = psbt.extract_tx();
-    debug!("tx:", &serialize(&tx.clone()).to_hex());
-    let blockchain = get_blockchain().await;
+pub async fn publish_psbt(psbt: Psbt) -> Result<TransactionDetails, BitcoinPsbtError> {
+    debug!("Signed PSBT:", base64::encode(&psbt.serialize()));
+
+    let fee_amount = psbt_fee_sats(&psbt)?;
+    let tx = extract_tx(psbt)?;
+    debug!("tx:", &tx_hex(&tx));
+    let blockchain = get_blockchain().await?;
     blockchain
         .broadcast(&tx)
         .await
         .map_err(|op| BitcoinPsbtError::CouldNotBroadcastPsbt(op.to_string()))?;
 
-    let txid = tx.txid();
-    let tx = blockchain.get_tx(&txid).await?;
+    let txid = tx.compute_txid();
+    let fetched = blockchain.get_tx(&txid).await?;
 
-    let mut sent = 0;
-    let mut received = 0;
-
-    if let Some(tx) = tx.clone() {
-        sent = tx.output.iter().fold(0, |sum, output| output.value + sum);
-        received = sent - fee_amount;
-    }
-
-    let details = TransactionDetails {
-        transaction: tx,
-        txid,
-        received,
-        sent,
-        fee: Some(fee_amount),
-        confirmation_time: None,
-    };
-
-    Ok(details)
+    Ok(details_from_broadcast_tx(fetched, txid, fee_amount))
 }
 
 /// Signs and broadcasts a transaction given a Psbt
 pub async fn sign_and_publish_psbt(
     wallet: &MemoryWallet,
-    mut psbt: PartiallySignedTransaction,
+    mut psbt: Psbt,
+    broadcast: bool,
 ) -> Result<TransactionDetails, BitcoinPsbtError> {
-    debug!("Signing PSBT...");
+    info!("Signing PSBT...");
     let finalized = wallet
         .lock()
         .await
-        .sign(&mut psbt, SignOptions::default())?;
-    debug!(format!("Finalized: {finalized}"));
+        .sign(&mut psbt, SignOptions::default())
+        .map_err(|e| BitcoinPsbtError::BdkSignError(e.to_string()))?;
+    info!(format!("Finalized: {finalized}"));
     if finalized {
-        debug!("Signed PSBT:", base64::encode(&serialize(&psbt)));
-        let fee_amount = psbt.fee_amount().expect("fee amount on PSBT is known");
-        let tx = psbt.extract_tx();
-        debug!("tx:", &serialize(&tx.clone()).to_hex());
-        let blockchain = get_blockchain().await;
-        blockchain.broadcast(&tx).await?;
+        debug!("Signed PSBT:", base64::encode(&psbt.serialize()));
 
-        let txid = tx.txid();
-        let tx = blockchain.get_tx(&txid).await?;
+        let fee_amount = psbt_fee_sats(&psbt)?;
 
-        let mut sent = 0;
-        let mut received = 0;
+        info!(format!("Fee amount: {fee_amount}"));
+        let tx = extract_tx(psbt)?;
+        debug!("tx:", &tx_hex(&tx));
+        let blockchain = get_blockchain().await?;
 
-        if let Some(tx) = tx.clone() {
-            sent = tx.output.iter().fold(0, |sum, output| output.value + sum);
-            received = sent - fee_amount;
+        if broadcast {
+            blockchain.broadcast(&tx).await?;
         }
 
-        let details = TransactionDetails {
-            transaction: tx,
-            txid,
-            received,
-            sent,
-            fee: Some(fee_amount),
-            confirmation_time: None,
-        };
+        let txid = tx.compute_txid();
+        let fetched = blockchain.get_tx(&txid).await?;
 
-        Ok(details)
+        Ok(details_from_broadcast_tx(fetched, txid, fee_amount))
     } else {
         Err(BitcoinPsbtError::CouldNotFinalizePsbt)
     }
@@ -152,7 +179,7 @@ pub async fn sign_and_publish_psbt(
 /// Signs and broadcasts a transaction given a Psbt
 pub async fn multi_sign_and_publish_psbt(
     wallets: Vec<MemoryWallet>,
-    mut psbt: PartiallySignedTransaction,
+    mut psbt: Psbt,
 ) -> Result<TransactionDetails, BitcoinPsbtError> {
     let total_wallets = wallets.len();
     debug!(format!(
@@ -162,50 +189,31 @@ pub async fn multi_sign_and_publish_psbt(
     let mut sign_count = 0;
     let mut finalized = false;
     for wallet in wallets {
-        finalized = wallet.lock().await.sign(
-            &mut psbt,
-            SignOptions {
-                allow_all_sighashes: true,
-                remove_partial_sigs: false,
-                ..Default::default()
-            },
-        )?;
+        finalized = wallet
+            .lock()
+            .await
+            .sign(&mut psbt, sign_opts())
+            .map_err(|e| BitcoinPsbtError::BdkSignError(e.to_string()))?;
 
         sign_count += 1;
         debug!(format!("PSBT Sign: ({sign_count}/{total_wallets})"));
     }
-
     debug!(format!("Finalized: {finalized}"));
     if finalized {
-        debug!("Signed PSBT:", base64::encode(&serialize(&psbt)));
-        let fee_amount = psbt.fee_amount().expect("fee amount on PSBT is known");
-        let tx = psbt.extract_tx();
-        debug!("tx:", &serialize(&tx.clone()).to_hex());
-        let blockchain = get_blockchain().await;
+        debug!("Signed PSBT:", base64::encode(&psbt.serialize()));
+
+        let fee_amount = psbt_fee_sats(&psbt)?;
+        let tx = extract_tx(psbt)?;
+        debug!("tx:", &tx_hex(&tx));
+        let blockchain = get_blockchain().await?;
         blockchain.broadcast(&tx).await?;
 
-        let txid = tx.txid();
-        let tx = blockchain.get_tx(&txid).await?;
+        let txid = tx.compute_txid();
+        let fetched = blockchain.get_tx(&txid).await?;
 
-        let mut sent = 0;
-        let mut received = 0;
-
-        if let Some(tx) = tx.clone() {
-            sent = tx.output.iter().fold(0, |sum, output| output.value + sum);
-            received = sent - fee_amount;
-        }
-
-        let details = TransactionDetails {
-            transaction: tx,
-            txid,
-            received,
-            sent,
-            fee: Some(fee_amount),
-            confirmation_time: None,
-        };
-
-        Ok(details)
+        Ok(details_from_broadcast_tx(fetched, txid, fee_amount))
     } else {
+        debug!("incomplete tx:", &tx_hex(&extract_tx(psbt)?));
         Err(BitcoinPsbtError::CouldNotFinalizePsbt)
     }
 }

@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 #[derive(Debug, Clone, Eq, PartialEq, Display, From, Error)]
 #[display(doc_comments)]
 pub enum ProxyServerError {
@@ -9,6 +11,27 @@ pub enum ProxyServerError {
     Parse(String),
     /// All endpoints failed error
     AllEndpointsFailed,
+    /// No parent found for {0:?}
+    MissingParent(PathBuf),
+}
+
+/// Prefix an RGB proxy consignment filename with the product named network
+/// (`testnet4`, `mutinynet`), not bitcoin 0.29 Display (`testnet`, `signet`).
+pub fn proxy_prefixed_name(name: &str, named_network: &str) -> String {
+    let networks = [
+        "bitcoin",
+        "testnet3",
+        "testnet4",
+        "testnet",
+        "signet",
+        "mutinynet",
+        "regtest",
+    ];
+    if networks.into_iter().any(|x| name.contains(x)) {
+        name.to_owned()
+    } else {
+        format!("{named_network}-{name}")
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -16,28 +39,33 @@ pub use server::{
     handle_file, proxy_consig_retrieve, proxy_consig_store, proxy_media_data_store,
     proxy_media_retrieve, proxy_metadata_retrieve,
 };
+
+#[cfg(target_arch = "wasm32")]
+pub use client::{
+    proxy_consig_retrieve, proxy_consig_store, proxy_media_data_store, proxy_media_retrieve,
+    proxy_metadata_retrieve,
+};
+
 #[cfg(not(target_arch = "wasm32"))]
 mod server {
+    use super::ProxyServerError;
+    use crate::debug;
+    use crate::{
+        constants::{RGB_PROXY_ENDPOINT, get_network},
+        info,
+        rgb::proxy::{
+            ContractMediaItem, MediaEncode, MediaMetadata, RgbProxyConsigFileReq,
+            RgbProxyConsigRes, RgbProxyConsigUploadReq, RgbProxyConsigUploadRes, RgbProxyMedia,
+            RgbProxyMediaFileReq, RgbProxyMediaRes, RgbProxyMediaUploadReq, RgbProxyMediaUploadRes,
+        },
+        util::upload_data,
+    };
     use amplify::hex::ToHex;
-    use bitcoin_hashes::{sha256, Hash};
+    use bitcoin::hashes::{Hash, sha256};
     use postcard::to_allocvec;
     use reqwest::multipart::{self, Part};
     use std::path::PathBuf;
     use tokio::fs;
-
-    use crate::{
-        constants::{NETWORK, RGB_PROXY_ENDPOINT},
-        info,
-        rgb::structs::{
-            MediaMetadata, RgbProxyConsigFileReq, RgbProxyConsigReq, RgbProxyConsigRes,
-            RgbProxyConsigUploadReq, RgbProxyConsigUploadRes, RgbProxyMedia, RgbProxyMediaFileReq,
-            RgbProxyMediaReq, RgbProxyMediaRes, RgbProxyMediaUploadReq, RgbProxyMediaUploadRes,
-        },
-        structs::{MediaEncode, MediaItemRequest},
-        util::{post_data, upload_data},
-    };
-
-    use super::ProxyServerError;
 
     pub async fn proxy_consig_store(
         request: RgbProxyConsigFileReq,
@@ -88,10 +116,10 @@ mod server {
     }
 
     pub async fn proxy_media_data_store(
-        media: MediaItemRequest,
+        media: ContractMediaItem,
         encode: MediaEncode,
     ) -> Result<MediaMetadata, ProxyServerError> {
-        if let Some(content) = retrieve_data(&media.uri).await {
+        if let Some(content) = retrieve_data(&media.source).await {
             let (id, source) = match encode {
                 MediaEncode::Base64 => {
                     let source = base64::encode(&content);
@@ -112,7 +140,7 @@ mod server {
                 }
             };
 
-            let metadata = MediaMetadata::new(&id, &media.ty, &media.uri, &source);
+            let metadata = MediaMetadata::new(&id, &media.ty, &media.source, &source);
 
             // Store File
             let attachment_id = id;
@@ -176,19 +204,17 @@ mod server {
     }
 
     pub async fn handle_file(name: &str, bytes: usize) -> Result<PathBuf, ProxyServerError> {
-        let mut final_name = name.to_string();
-        let network = NETWORK.read().await.to_string();
-        let networks = ["bitcoin", "testnet", "signet", "regtest"];
-        if !networks.into_iter().any(|x| name.contains(x)) {
-            final_name = format!("{network}-{name}");
-        }
+        let named_network = get_network().await;
+        let final_name = super::proxy_prefixed_name(name, &named_network);
 
         let filepath = std::path::Path::new(
             &std::env::var("RGB_PROXY_DIR").unwrap_or("/tmp/bitmaskd/proxy".to_owned()),
         )
         .join(final_name);
 
-        let filedir = filepath.parent().unwrap();
+        let filedir = filepath
+            .parent()
+            .ok_or_else(|| ProxyServerError::MissingParent(filepath.clone()))?;
         fs::create_dir_all(filedir)
             .await
             .map_err(|op| ProxyServerError::IO(op.to_string()))?;
@@ -239,24 +265,117 @@ mod server {
         let endpoints = RGB_PROXY_ENDPOINT.read().await.to_string();
         let url = format!("{endpoints}/json-rpc");
 
-        let body = serde_json::to_string(&RgbProxyConsigReq {
-            recipient_id: recipient_id.to_string(),
-        })
-        .unwrap_or_default();
-        let form = multipart::Form::new()
-            .text("method", "consignment.get")
-            .text("jsonrpc", "2.0")
-            .text("id", recipient_id.to_string())
-            .text("params", body);
+        let body = serde_json::json!({
+            "method": "consignment.get",
+            "jsonrpc": "2.0",
+            "id": recipient_id.to_string(),
+            "params": {
+                "recipient_id": recipient_id.to_string()
+            }
+        });
 
-        let (resp, _) = post_data(&url, form).await.map_err(|_| {
-            ProxyServerError::Server(format!("Error sending JSON POST request to {url}"))
-        })?;
+        info!("-> fetch_consignment_get: Sending request to {}", url);
+        debug!("   | Request body: {}", body.to_string());
 
-        let resp = match serde_json::from_str(&resp) {
-            Ok(resp) => Some(resp),
-            Err(_) => None,
+        let client = reqwest::Client::new();
+
+        // Send the request and await the response object
+        let response_result = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await;
+
+        let response = match response_result {
+            Ok(resp) => {
+                info!(
+                    "   | Received response with status: {}",
+                    resp.status().to_string()
+                );
+                resp
+            }
+            Err(e) => {
+                debug!("   ! FAILED to send request to {}: {}", url, e.to_string());
+                return Err(ProxyServerError::Server(format!(
+                    "Error sending JSON POST request to {}: {}",
+                    url, e
+                )));
+            }
         };
+
+        // Get the response body as text, handling potential errors
+        let resp_text = match response.text().await {
+            Ok(text) => {
+                debug!("   | Received raw response text: {}", text);
+                text
+            }
+            Err(e) => {
+                debug!("   ! FAILED to read response text: {}", e.to_string());
+                return Err(ProxyServerError::Parse(format!(
+                    "Failed to read response text: {}",
+                    e
+                )));
+            }
+        };
+
+        // Now, parse the response text
+        let resp_result = serde_json::from_str::<RgbProxyConsigRes>(&resp_text);
+
+        match resp_result {
+            Ok(parsed_resp) => {
+                info!("<- fetch_consignment_get: Successfully parsed response.");
+                Ok(Some(parsed_resp))
+            }
+            Err(e) => {
+                // This is a common case for 404s or other errors that return non-JSON bodies
+                debug!(
+                    "   | Failed to parse response as RgbProxyConsigRes. Error: {}. This may be expected if no consignment was found.",
+                    e.to_string()
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    async fn fetch_media_get(
+        attachment_id: &str,
+    ) -> Result<Option<RgbProxyMediaRes>, ProxyServerError> {
+        let endpoints = RGB_PROXY_ENDPOINT.read().await.to_string();
+        let url = format!("{endpoints}/json-rpc");
+
+        // 1. Create a JSON object for the request body.
+        let json_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "media.get",
+            "id": attachment_id,
+            "params": {
+                "attachment_id": attachment_id
+            }
+        });
+
+        // 2. Use a standard HTTP client to send the request with the correct Content-Type.
+        let client = reqwest::Client::new();
+        let response = client
+            .post(&url)
+            .header("Content-Type", "application/json") // Set the correct header
+            .body(json_body.to_string()) // Set the body to the serialized JSON
+            .send()
+            .await
+            .map_err(|e| {
+                ProxyServerError::Server(format!(
+                    "Error sending JSON POST request to {}: {}",
+                    url, e
+                ))
+            })?;
+
+        // 3. Get the response text and parse it.
+        let resp_text = response
+            .text()
+            .await
+            .map_err(|e| ProxyServerError::Parse(e.to_string()))?;
+        let resp = serde_json::from_str(&resp_text).ok();
+
         Ok(resp)
     }
 
@@ -269,12 +388,15 @@ mod server {
         let file_info = fs::read(request.file_name.clone())
             .await
             .unwrap_or_default();
+
         let params = request.params;
         let body = serde_json::to_string(&params).unwrap_or_default();
+
+        // Create the multipart form with the correct method and id for media.post
         let form = multipart::Form::new()
             .text("method", "media.post")
             .text("jsonrpc", "2.0")
-            .text("id", params.attachment_id)
+            .text("id", params.attachment_id.clone()) // Use attachment_id for media
             .text("params", body)
             .part("file", Part::bytes(file_info).file_name(request.file_name));
 
@@ -287,34 +409,6 @@ mod server {
         Ok(resp)
     }
 
-    async fn fetch_media_get(
-        attachment_id: &str,
-    ) -> Result<Option<RgbProxyMediaRes>, ProxyServerError> {
-        let endpoints = RGB_PROXY_ENDPOINT.read().await.to_string();
-        let url = format!("{endpoints}/json-rpc");
-
-        let body = serde_json::to_string(&RgbProxyMediaReq {
-            attachment_id: attachment_id.to_string(),
-        })
-        .unwrap_or_default();
-        let form = multipart::Form::new()
-            .text("method", "media.get")
-            .text("jsonrpc", "2.0")
-            .text("id", attachment_id.to_string())
-            .text("params", body);
-
-        let (resp, _) = post_data(&url, form).await.map_err(|_| {
-            ProxyServerError::Server(format!("Error sending JSON POST request to {url}"))
-        })?;
-
-        let resp = match serde_json::from_str(&resp) {
-            Ok(resp) => Some(resp),
-            Err(_) => None,
-        };
-
-        Ok(resp)
-    }
-
     async fn retrieve_data(url: &str) -> Option<Vec<u8>> {
         let client = reqwest::Client::new();
         let response = client
@@ -324,13 +418,11 @@ mod server {
             .send()
             .await;
 
-        if let Ok(response) = response {
-            let status_code = response.status().as_u16();
-            if status_code == 200 {
-                if let Ok(bytes) = response.bytes().await {
-                    return Some(bytes.to_vec());
-                }
-            }
+        if let Ok(response) = response
+            && response.status().as_u16() == 200
+            && let Ok(bytes) = response.bytes().await
+        {
+            return Some(bytes.to_vec());
         }
 
         None
@@ -338,33 +430,28 @@ mod server {
 }
 
 #[cfg(target_arch = "wasm32")]
-pub use client::{
-    proxy_consig_retrieve, proxy_consig_store, proxy_media_data_store, proxy_media_retrieve,
-    proxy_metadata_retrieve,
-};
-
-#[cfg(target_arch = "wasm32")]
 mod client {
+    use crate::proxy::ProxyServerError;
+    use crate::rgb::proxy::RgbProxyConsigCarbonadoReq;
     use crate::{
-        constants::{BITMASK_ENDPOINT, NETWORK},
-        rgb::structs::{
-            MediaMetadata, RgbProxyConsigCarbonadoReq, RgbProxyConsigFileReq, RgbProxyConsigRes,
-            RgbProxyConsigUploadRes, RgbProxyMediaRes,
+        constants::{BITMASK_ENDPOINT, get_network},
+        rgb::proxy::{
+            ContractMediaItem, MediaEncode, MediaExtractRequest, MediaMetadata,
+            RgbProxyConsigFileReq, RgbProxyConsigRes, RgbProxyConsigUploadRes, RgbProxyMediaRes,
         },
-        structs::{MediaEncode, MediaExtractRequest, MediaItemRequest},
         util::{get, post_json},
     };
-
-    use super::ProxyServerError;
+    use serde_json::json;
 
     pub async fn proxy_consig_store(
         request: RgbProxyConsigFileReq,
     ) -> Result<RgbProxyConsigUploadRes, ProxyServerError> {
-        let network = NETWORK.read().await.to_string();
+        let named_network = get_network().await;
         let endpoint = BITMASK_ENDPOINT.read().await.to_string();
 
         let name = request.clone().file_name;
-        let url = format!("{endpoint}/proxy/consignment/{network}-{name}");
+        let prefixed = super::proxy_prefixed_name(&name, &named_network);
+        let url = format!("{endpoint}/proxy/consignment/{prefixed}");
         let body = RgbProxyConsigCarbonadoReq::from(request);
         let (response, _) = post_json(&url, &body.clone())
             .await
@@ -379,17 +466,26 @@ mod client {
         request_id: &str,
     ) -> Result<Option<RgbProxyConsigRes>, ProxyServerError> {
         let endpoint = BITMASK_ENDPOINT.read().await.to_string();
+        let url = format!("{endpoint}/json-rpc");
 
-        let request_id = request_id.replace("utxob:", "");
-        let url = format!("{endpoint}/proxy/consignment/{request_id}");
-        let response = get(&url, None)
+        let body = json!({
+            "jsonrpc": "2.0",
+            "method": "consignment.get",
+            "id": request_id,
+            "params": {
+                "recipient_id": request_id
+            }
+        });
+
+        let (response, status_code) = post_json(&url, &body)
             .await
             .map_err(|op| ProxyServerError::Parse(op.to_string()))?;
 
-        let resp = match serde_json::from_str::<RgbProxyConsigRes>(&response) {
-            Ok(resp) => Some(resp),
-            Err(_) => None,
-        };
+        if status_code >= 400 {
+            return Ok(None);
+        }
+
+        let resp = serde_json::from_str::<RgbProxyConsigRes>(&response).ok();
 
         Ok(resp)
     }
@@ -398,16 +494,26 @@ mod client {
         attachment_id: &str,
     ) -> Result<Option<RgbProxyMediaRes>, ProxyServerError> {
         let endpoint = BITMASK_ENDPOINT.read().await.to_string();
+        let url = format!("{endpoint}/json-rpc");
 
-        let url = format!("{endpoint}/proxy/media/{attachment_id}");
-        let response = get(&url, None)
+        let body = json!({
+            "jsonrpc": "2.0",
+            "method": "media.get",
+            "id": attachment_id,
+            "params": {
+                "attachment_id": attachment_id
+            }
+        });
+
+        let (response, status_code) = post_json(&url, &body)
             .await
             .map_err(|op| ProxyServerError::Parse(op.to_string()))?;
 
-        let resp = match serde_json::from_str::<RgbProxyMediaRes>(&response) {
-            Ok(resp) => Some(resp),
-            Err(_) => None,
-        };
+        if status_code >= 400 {
+            return Ok(None);
+        }
+
+        let resp = serde_json::from_str::<RgbProxyMediaRes>(&response).ok();
         Ok(resp)
     }
 
@@ -415,25 +521,34 @@ mod client {
         attachment_id: &str,
     ) -> Result<Option<RgbProxyMediaRes>, ProxyServerError> {
         let endpoint = BITMASK_ENDPOINT.read().await.to_string();
+        let url = format!("{endpoint}/json-rpc");
 
-        let url = format!("{endpoint}/proxy/media-metadata/{attachment_id}");
-        let response = get(&url, None)
+        let body = json!({
+            "jsonrpc": "2.0",
+            "method": "media.get",
+            "id": attachment_id,
+            "params": {
+                "attachment_id": attachment_id
+            }
+        });
+
+        let (response, status_code) = post_json(&url, &body)
             .await
             .map_err(|op| ProxyServerError::Parse(op.to_string()))?;
 
-        let resp = match serde_json::from_str::<RgbProxyMediaRes>(&response) {
-            Ok(resp) => Some(resp),
-            Err(_) => None,
-        };
+        if status_code >= 400 {
+            return Ok(None);
+        }
+
+        let resp = serde_json::from_str::<RgbProxyMediaRes>(&response).ok();
         Ok(resp)
     }
 
     pub async fn proxy_media_data_store(
-        media: MediaItemRequest,
+        media: ContractMediaItem,
         encode: MediaEncode,
     ) -> Result<MediaMetadata, ProxyServerError> {
         let endpoint = BITMASK_ENDPOINT.read().await.to_string();
-
         let url = format!("{endpoint}/proxy/media-metadata");
         let body = MediaExtractRequest {
             encode,

@@ -1,198 +1,280 @@
-use amplify::{
-    confinement::{Confined, SmallBlob},
-    Wrapper,
-};
-use bp::{seals::txout::ExplicitSeal, Chain, Txid};
-use rgb_schemata::{nia_rgb20, nia_schema, uda_rgb21, uda_schema};
-use rgbstd::{
-    containers::Contract,
-    contract::GenesisSeal,
-    interface::{
-        rgb20, rgb21,
-        rgb21::{Allocation, EmbeddedMedia, OwnedFraction, TokenData, TokenIndex},
-        BuilderError, ContractBuilder,
-    },
-    persistence::{Inventory, Stash, Stock},
-    resolvers::ResolveHeight,
-    stl::{
-        Amount, Attachment, ContractData, DivisibleAssetSpec, MediaType, Precision,
-        RicardianContract, Timestamp,
-    },
-    validation::{Failure, ResolveTx},
-};
 use std::str::FromStr;
-use strict_types::encoding::TypeName;
 
-use crate::structs::IssueMediaRequest;
+use crate::rgb::mapper::AssetSchema;
+use crate::rgb::proxy::ContractMedia;
+use crate::rgb::{models::AssetType, models::ContractAmount};
+use crate::structs::{IssueRequest, SecretString};
+use amplify::confinement::{Confined, SmallBlob};
+use bpstd::Outpoint;
+use bpwallet::OutpointParseError;
+use dbc::Method;
+use rgb::{
+    Allocation, GenesisSeal, TokenIndex,
+    validation::{Failure, ResolveWitness},
+};
+use rgbcore::{ChainNet, Identity};
+use rgbstd::containers::ConsignmentExt;
+use rgbstd::contract::{BuilderError, ContractBuilder, IssuerWrapper};
+use rgbstd::stl::{AssetSpec, ContractTerms, EmbeddedMedia, TokenData};
+use rgbstd::{
+    OwnedFraction,
+    containers::{BuilderSeal, Contract},
+    invoice::{Amount, Precision},
+    persistence::Stock,
+    stl::{Attachment, MediaType, RicardianContract},
+};
+use schemata::{NIA_SCHEMA_ID, NonInflatableAsset, UDA_SCHEMA_ID, UniqueDigitalAsset};
+use strict_encoding::{TypeName, tn};
 
-#[derive(Clone, PartialEq, Debug, Display, Error, From)]
+#[derive(Clone, Eq, PartialEq, Debug, Display, Error, From)]
 #[display(doc_comments)]
 pub enum IssueContractError {
-    Issue(IssueError),
-    Forge(BuilderError),
-    /// The contract interface {0} is not supported in issuer operation
-    NoContractSupport(String),
+    /// The contract interface {0} is not supported
+    NoSupport(String),
+    /// contract media {0} cannot be parsed. {1}
+    InvalidMedia(String, String),
+    /// preview media exceded max number of bytes. expected: 65535 / current: {0}
+    WrongPreview(usize),
     /// The contract {0} contains failures {1:?}
-    ContractInvalid(String, Vec<Failure>),
-    /// The contract {0} cannot be imported (reason: {1})
-    NoImport(String, String),
+    WrongContract(String, Box<Vec<Failure>>),
+    /// The contract {0} cannot be imported. {1}
+    WrongImport(String, String),
+    /// rgb stock error. {0}
+    Stock(String),
+    /// rgb seals txout error. {0}
+    SealsTxoutError(#[from] OutpointParseError),
+    /// rgb strict encoding error - u8. {0}
+    StenErrorU8(#[from] strict_encoding::VariantError<u8>),
+    /// rgb strict encoding error - r sring. {0}
+    StenErrorRStr(#[from] strict_encoding::InvalidRString),
+    /// rgb interface builder error. {0}
+    RgbInterfaceBuilderError(#[from] BuilderError),
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn issue_contract<T>(
-    ticker: &str,
-    name: &str,
-    description: &str,
-    precision: u8,
-    supply: u64,
-    iface: &str,
-    seal: &str,
-    network: &str,
-    meta: Option<IssueMediaRequest>,
-    resolver: &mut T,
-    stock: &mut Stock,
-) -> Result<Contract, IssueContractError>
-where
-    T: ResolveHeight + ResolveTx,
-    T::Error: 'static,
-{
-    let iface_name = TypeName::from_str(iface)
-        .map_err(|_| IssueContractError::Forge(BuilderError::InterfaceMismatch))?;
+#[derive(Clone, Debug, Display, Error, From)]
+#[display(doc_comments)]
+pub struct IssueContractParams {
+    pub ticker: String,
+    pub name: String,
+    pub description: String,
+    pub precision: u8,
+    pub supply: u64,
+    pub iface: TypeName,
+    pub seal: SecretString,
+    pub chain_net: ChainNet,
+    pub meta: Option<ContractMedia>,
+}
 
-    let iface = stock
-        .iface_by_name(&iface_name)
-        .map_err(|_| IssueContractError::Forge(BuilderError::InterfaceMismatch))?;
-
-    let contract_issued = match iface.name.as_str() {
-        "RGB20" => {
-            issue_fungible_asset(ticker, name, description, precision, supply, seal, network)
-        }
-        "RGB21" => issue_uda_asset(
+impl IssueContractParams {
+    pub fn with(value: IssueRequest, chain_net: ChainNet, media: Option<ContractMedia>) -> Self {
+        let IssueRequest {
             ticker,
             name,
             description,
             precision,
             supply,
+            iface,
             seal,
-            network,
-            meta,
-        ),
-        _ => {
-            return Err(IssueContractError::NoContractSupport(
-                iface.name.to_string(),
-            ))
+            ..
+        } = value;
+
+        let contract_amount = ContractAmount::parse(supply.to_string(), precision);
+        Self {
+            ticker,
+            name,
+            description,
+            precision,
+            chain_net,
+            meta: media,
+            iface: tn!(iface),
+            seal: SecretString(seal),
+            supply: contract_amount.to_value(),
+        }
+    }
+}
+
+#[derive(Clone)]
+/// Options used in issuing asset operation
+pub struct IssueContractOptions {
+    /// Define the default close method for issue assets
+    pub method: Method,
+    /// Feature-flag to enable send data to proxy server
+    pub proxy: bool,
+    /// Feature-flag to enable sync data to carbonado server
+    pub sync: bool,
+}
+
+impl Default for IssueContractOptions {
+    fn default() -> Self {
+        Self {
+            method: Method::TapretFirst,
+            sync: true,
+            proxy: false,
+        }
+    }
+}
+
+#[allow(clippy::result_large_err)]
+pub fn issue_contract<T>(
+    params: IssueContractParams,
+    options: &IssueContractOptions,
+    rgb_stock: &mut Stock,
+    rgb_resolver: &mut T,
+) -> Result<Contract, IssueContractError>
+where
+    T: ResolveWitness + Clone,
+{
+    let IssueContractParams {
+        iface, chain_net, ..
+    } = params.clone();
+
+    let iface = iface.to_string();
+    let asset_type =
+        AssetType::from_str(&iface).map_err(|_| IssueContractError::NoSupport(iface))?;
+
+    let contract_issued = match asset_type {
+        AssetType::RGB20 => issue_fungible_asset(params, options)?,
+        AssetType::RGB21 => issue_uda_asset(params, options)?,
+        err => return Err(IssueContractError::NoSupport(err.to_string())),
+    };
+
+    let contract_id = contract_issued.contract_id();
+
+    let type_system = match asset_type {
+        AssetType::RGB20 => AssetSchema::from(NIA_SCHEMA_ID).types(),
+        AssetType::RGB21 => AssetSchema::from(UDA_SCHEMA_ID).types(),
+        _ => return Err(IssueContractError::NoSupport(asset_type.to_string())),
+    };
+
+    let valid_contract = match contract_issued.validate(
+        rgb_resolver,
+        &crate::rgb::compat::validation_config(chain_net, type_system),
+    ) {
+        Ok(contract) => contract,
+        Err(err) => {
+            let failures = match err {
+                rgb::validation::ValidationError::InvalidConsignment(failure) => {
+                    vec![failure]
+                }
+                other => vec![rgb::validation::Failure::Custom(other.to_string())],
+            };
+            return Err(IssueContractError::WrongContract(
+                contract_id.to_string(),
+                Box::new(failures),
+            ));
         }
     };
 
-    let resp = contract_issued.map_err(IssueContractError::Issue)?;
-    let contract_id = resp.contract_id().to_string();
-    let resp = resp.validate(resolver).map_err(|consig| {
-        IssueContractError::ContractInvalid(
-            contract_id.clone(),
-            consig.into_validation_status().unwrap_or_default().failures,
-        )
-    })?;
+    rgb_stock
+        .import_contract(valid_contract, rgb_resolver.clone())
+        .map_err(|err| IssueContractError::WrongImport(contract_id.to_string(), err.to_string()))?;
 
-    stock
-        .import_contract(resp.clone(), resolver)
-        .map_err(|err| IssueContractError::NoImport(contract_id, err.to_string()))?;
-
-    Ok(resp)
+    let final_contract = rgb_stock
+        .export_contract(contract_id)
+        .map_err(|err| IssueContractError::WrongImport(contract_id.to_string(), err.to_string()))?;
+    Ok(final_contract)
 }
 
-/// RGB20 interface
+#[allow(clippy::result_large_err)]
 fn issue_fungible_asset(
-    ticker: &str,
-    name: &str,
-    description: &str,
-    precision: u8,
-    supply: u64,
-    seal: &str,
-    network: &str,
-) -> Result<Contract, IssueError> {
-    let iface = rgb20();
-    let schema = nia_schema();
-    let iimpl = nia_rgb20();
-
+    params: IssueContractParams,
+    _options: &IssueContractOptions,
+) -> Result<Contract, IssueContractError> {
+    let IssueContractParams {
+        ticker,
+        name,
+        description,
+        precision,
+        seal,
+        supply,
+        chain_net,
+        ..
+    } = params;
     let ticker: &'static str = Box::leak(ticker.to_string().into_boxed_str());
     let name: &'static str = Box::leak(name.to_string().into_boxed_str());
-    let description: &'static str = Box::leak(description.to_string().into_boxed_str());
-    let created = Timestamp::now();
 
-    let precision = Precision::try_from(precision).expect("invalid precision");
-    let spec = DivisibleAssetSpec::new(ticker, name, precision);
-    let terms = RicardianContract::from_str(description).expect("invalid contract text");
-    let contract_data = ContractData { terms, media: None };
+    let precision = Precision::try_from(precision)?;
+    let spec = AssetSpec::new(ticker, name, precision);
+    let text = RicardianContract::from_str(&description)?;
+    let contract_data = ContractTerms { text, media: None };
 
-    // Issuer State
-    let seal = ExplicitSeal::<Txid>::from_str(seal).expect("invalid seal definition");
-    let seal = GenesisSeal::from(seal);
+    let seal =
+        Outpoint::from_str(&seal.to_string()).map_err(IssueContractError::SealsTxoutError)?;
 
-    let contract = ContractBuilder::with(iface, schema, iimpl)
-        .expect("schema fails to implement RGB20 interface")
-        .set_chain(Chain::from_str(network).expect("invalid network"))
-        .add_global_state("spec", spec)
-        .expect("invalid spec")
-        .add_global_state("created", created)
-        .expect("invalid created")
-        .add_global_state("data", contract_data)
-        .expect("invalid contract text")
-        .add_global_state("issuedSupply", Amount::from(supply))
-        .expect("invalid issued supply")
-        .add_fungible_state("assetOwner", seal, supply)
-        .expect("invalid asset amount")
-        .issue_contract()
-        .expect("contract doesn't fit schema requirements");
-    Ok(contract)
+    let seal = GenesisSeal::new_random(
+        crate::rgb::compat::txid_bp_to_bitcoin(seal.txid),
+        crate::rgb::compat::vout_bp_to_rgb(seal.vout),
+    );
+    let seal = BuilderSeal::Revealed(seal);
+
+    let builder = ContractBuilder::with(
+        Identity::default(),
+        NonInflatableAsset::schema(),
+        NonInflatableAsset::types(),
+        NonInflatableAsset::scripts(),
+        chain_net,
+    );
+
+    let contract = builder
+        .add_global_state("spec", spec)?
+        .add_global_state("issuedSupply", Amount::from(supply))?
+        .add_global_state("terms", contract_data)?
+        .add_fungible_state("assetOwner", seal, supply)?
+        .issue_contract()?;
+
+    Ok(contract.into_consignment())
 }
 
-#[derive(Clone, PartialEq, Debug, Display, Error, From)]
-#[display(doc_comments)]
-pub enum IssueError {
-    RgbError(#[from] BuilderError),
-
-    HexError(#[from] hex::FromHexError),
-}
-
-/// RGB21 interface
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::result_large_err)]
 fn issue_uda_asset(
-    ticker: &str,
-    name: &str,
-    description: &str,
-    precision: u8,
-    supply: u64,
-    seal: &str,
-    network: &str,
-    meta: Option<IssueMediaRequest>,
-) -> Result<Contract, IssueError> {
-    let iface = rgb21();
-    let schema = uda_schema();
-    let iimpl = uda_rgb21();
+    params: IssueContractParams,
+    _options: &IssueContractOptions,
+) -> Result<Contract, IssueContractError> {
+    let IssueContractParams {
+        ticker,
+        name,
+        description,
+        precision,
+        seal,
+        meta,
+        chain_net,
+        ..
+    } = params.clone();
 
     let ticker: &'static str = Box::leak(ticker.to_string().into_boxed_str());
     let name: &'static str = Box::leak(name.to_string().into_boxed_str());
-    let description: &'static str = Box::leak(description.to_string().into_boxed_str());
-    let precision = Precision::try_from(precision).expect("invalid precision");
-    let spec = DivisibleAssetSpec::new(ticker, name, precision);
-    let terms = RicardianContract::from_str(description).expect("invalid terms");
-    let created = Timestamp::now();
-    let fraction = OwnedFraction::from_inner(supply);
 
+    let precision = Precision::try_from(precision)?;
+    let spec = AssetSpec::new(ticker, name, precision);
+    let text = RicardianContract::from_str(&description)?;
+    let terms = ContractTerms { text, media: None };
+
+    let seal =
+        Outpoint::from_str(&seal.to_string()).map_err(IssueContractError::SealsTxoutError)?;
+    let seal = GenesisSeal::new_random(
+        crate::rgb::compat::txid_bp_to_bitcoin(seal.txid),
+        crate::rgb::compat::vout_bp_to_rgb(seal.vout),
+    );
+    let seal = BuilderSeal::Revealed(seal);
+
+    let token_index = 1;
+    let token_fraction = 1;
     let mut tokens_data = vec![];
     let mut allocations = vec![];
 
-    // Toke Data
-    let token_index = TokenIndex::from_inner(0);
-    if let Some(media_data) = meta {
+    if let Some(media_data) = meta.clone() {
         // Preview
         let preview = if let Some(media_preview) = media_data.preview {
-            let ty_preview: &'static str = Box::leak(media_preview.ty.to_string().into_boxed_str());
-            let preview = base64::decode(&media_preview.source).expect("invalid preview data");
+            let ty: &'static str = Box::leak(media_preview.ty.to_string().into_boxed_str());
+            let preview = base64::decode(&media_preview.source).map_err(|op| {
+                IssueContractError::InvalidMedia("preview".to_string(), op.to_string())
+            })?;
+            let preview_len = preview.len();
 
             Some(EmbeddedMedia {
-                ty: MediaType::with(ty_preview),
-                data: SmallBlob::try_from_iter::<Vec<u8>>(preview).expect("invalid preview data"),
+                ty: MediaType::with(ty),
+                data: SmallBlob::try_from(preview)
+                    .map_err(|_| IssueContractError::WrongPreview(preview_len))?,
             })
         } else {
             None
@@ -200,13 +282,15 @@ fn issue_uda_asset(
 
         // Media
         let media = if let Some(media) = media_data.media {
-            let mut digest: [u8; 32] = [0; 32];
-            digest.copy_from_slice(&hex::decode(&media.source)?);
             let ty: &'static str = Box::leak(media.ty.to_string().into_boxed_str());
+            let mut digest: [u8; 32] = [0; 32];
+            digest.copy_from_slice(&hex::decode(&media.source).map_err(|op| {
+                IssueContractError::InvalidMedia("media".to_string(), op.to_string())
+            })?);
 
             Some(Attachment {
                 ty: MediaType::with(ty),
-                digest,
+                digest: digest.into(),
             })
         } else {
             None
@@ -215,23 +299,25 @@ fn issue_uda_asset(
         // Attachments
         let mut attachments = bmap![];
         for (index, attach) in media_data.attachments.iter().enumerate() {
-            let mut digest: [u8; 32] = [0; 32];
-            digest.copy_from_slice(&hex::decode(&attach.source)?);
             let ty: &'static str = Box::leak(attach.ty.to_string().into_boxed_str());
+            let mut digest: [u8; 32] = [0; 32];
+            digest.copy_from_slice(&hex::decode(&attach.source).map_err(|op| {
+                IssueContractError::InvalidMedia("attachment".to_string(), op.to_string())
+            })?);
 
             attachments.insert(
                 index as u8,
                 Attachment {
                     ty: MediaType::with(ty),
-                    digest,
+                    digest: digest.into(),
                 },
             );
         }
 
-        let attachments = Confined::from_collection_unsafe(attachments);
-        let naming = spec.naming.clone();
+        let attachments = Confined::from_checked(attachments);
+        let naming = spec.clone();
         let token_data = TokenData {
-            index: token_index,
+            index: token_index.into(),
             name: Some(naming.name),
             ticker: Some(naming.ticker),
             preview,
@@ -240,38 +326,35 @@ fn issue_uda_asset(
             ..Default::default()
         };
 
-        let allocation = Allocation::with(token_index, fraction);
+        let allocation = Allocation::with(
+            TokenIndex::from(token_index),
+            OwnedFraction::from(token_fraction),
+        );
         tokens_data.push(token_data);
         allocations.push(allocation);
     }
 
-    let seal = ExplicitSeal::<Txid>::from_str(seal).expect("invalid seal definition");
-    let seal = GenesisSeal::from(seal);
+    let mut builder = ContractBuilder::with(
+        Identity::default(),
+        UniqueDigitalAsset::schema(),
+        UniqueDigitalAsset::types(),
+        UniqueDigitalAsset::scripts(),
+        chain_net,
+    );
 
-    let mut contract = ContractBuilder::with(iface, schema, iimpl)
-        .expect("schema fails to implement RGB21 interface")
-        .set_chain(Chain::from_str(network).expect("invalid network"))
-        .add_global_state("spec", spec)
-        .expect("invalid spec")
-        .add_global_state("created", created)
-        .expect("invalid created")
-        .add_global_state("terms", terms)
-        .expect("invalid contract text");
+    builder = builder
+        .add_global_state("spec", spec)?
+        .add_global_state("terms", terms)?;
 
     for token_data in tokens_data {
-        contract = contract
-            .add_global_state("tokens", token_data)
-            .expect("invalid tokens");
+        builder = builder.add_global_state("tokens", token_data)?;
     }
 
     for allocation in allocations {
-        contract = contract
-            .add_data_state("assetOwner", seal, allocation)
-            .expect("invalid asset blob");
+        builder = builder.add_data("assetOwner", seal, allocation)?;
     }
 
-    let contract = contract
-        .issue_contract()
-        .expect("contract doesn't fit schema requirements");
-    Ok(contract)
+    let contract = builder.issue_contract()?;
+
+    Ok(contract.into_consignment())
 }

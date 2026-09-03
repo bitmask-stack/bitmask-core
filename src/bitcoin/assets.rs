@@ -1,14 +1,15 @@
 use anyhow::Result;
-use bdk::{database::AnyDatabase, LocalUtxo, SignOptions, Wallet};
-use bitcoin::psbt::PartiallySignedTransaction;
+use bdk_wallet::bitcoin::{Amount, FeeRate, psbt::Psbt};
+use bdk_wallet::{LocalOutput, SignOptions, Wallet};
 
+use crate::bitcoin::fee_rate_from_sat_vb;
 use crate::debug;
 
 pub fn dust_tx(
-    btc_wallet: &Wallet<AnyDatabase>,
+    btc_wallet: &mut Wallet,
     fee_rate: f32,
-    first_utxo: Option<&LocalUtxo>,
-) -> Result<PartiallySignedTransaction> {
+    first_utxo: Option<&LocalOutput>,
+) -> Result<Psbt> {
     let dust_amt = if fee_rate < 3.0 {
         546
     } else {
@@ -16,15 +17,18 @@ pub fn dust_tx(
     };
 
     let pubkey = match first_utxo {
-        Some(utxo) => utxo.txout.script_pubkey.to_owned(),
-        None => todo!(),
+        Some(utxo) => utxo.txout.script_pubkey.clone(),
+        None => anyhow::bail!("dust_tx needs a UTXO"),
     };
 
     let mut tx_builder = btc_wallet.build_tx();
-    tx_builder.add_recipient(pubkey, dust_amt);
-    let (mut dust_psbt, tx_details) = tx_builder.finish()?;
+    tx_builder.add_recipient(pubkey, Amount::from_sat(dust_amt));
+    tx_builder.fee_rate(
+        FeeRate::from_sat_per_vb(fee_rate.ceil() as u64)
+            .unwrap_or_else(|| fee_rate_from_sat_vb(1.0)),
+    );
+    let mut dust_psbt = tx_builder.finish()?;
 
-    debug!(format!("dust tx details: {tx_details:#?}"));
     let finalized = btc_wallet.sign(&mut dust_psbt, SignOptions::default())?;
     debug!(format!("PSBT signed. Finalized: {finalized}"));
     btc_wallet.finalize_psbt(&mut dust_psbt, SignOptions::default())?;

@@ -9,6 +9,14 @@ use wasm_bindgen_futures::JsFuture;
 use wasm_bindgen_test::*;
 use web_sys::console;
 
+pub const USER_PUBKEY: &str = "tpubDDbo51VYPBPPjoGLX4rzBbW21qV1D9pUYJA6c5U7r3raJCuzzGqk1dUocNZ98VmxmQK5mpjZxFwc7gsyavw75v6BYbCJ6gcks2iXq83cr59";
+
+pub const ISSUER_MNEMONIC: &str =
+    "ordinary crucial edit settle pencil lion appear unlock left fly century license";
+
+pub const OWNER_MNEMONIC: &str =
+    "apology pull visa moon retreat spell elite extend secret region fly diary";
+
 pub async fn new_block() -> Result<JsValue, JsValue> {
     let bitmask_endpoint = BITMASK_ENDPOINT.read().await.to_string();
     let endpoint = format!("{bitmask_endpoint}/regtest/block");

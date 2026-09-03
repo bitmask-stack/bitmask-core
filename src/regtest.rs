@@ -1,14 +1,13 @@
+#![allow(clippy::panic, clippy::expect_used)] // Allowed because this is only used in testing
 #![cfg(not(target_arch = "wasm32"))]
-use std::{
-    env, fs, path,
-    process::{Command, Stdio},
-};
-
-use anyhow::Result;
-
+#[cfg(feature = "server")]
 use crate::carbonado::metrics::MetricsData;
+use std::{env, process::Command};
+#[cfg(feature = "server")]
+use std::{fs, path};
 
-pub fn init_fs() -> Result<()> {
+#[cfg(feature = "server")]
+pub fn init_fs() -> anyhow::Result<()> {
     let dir = env::var("CARBONADO_DIR").unwrap_or("/tmp/bitmaskd/carbonado".to_owned());
     let dir = path::Path::new(&dir);
 
@@ -25,27 +24,21 @@ pub fn send_coins(address: &str, amount: &str) {
     let path = env::current_dir().expect("oh no!");
     let path = path.to_str().expect("oh no!");
     let full_file = format!("{}/regtest/send_coins.sh", path);
+
     Command::new("bash")
         .arg(full_file)
         .args([address, amount])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap()
-        .wait()
-        .expect("oh no!");
+        .output()
+        .expect("process spawn");
 }
 
 pub fn new_block() {
     let path = env::current_dir().expect("oh no!");
     let path = path.to_str().expect("oh no!");
     let full_file = format!("{}/regtest/new_block.sh", path);
+
     Command::new("bash")
         .arg(full_file)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap()
-        .wait()
-        .expect("oh no!");
+        .output()
+        .expect("process spawn");
 }

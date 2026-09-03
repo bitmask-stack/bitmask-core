@@ -1,7 +1,8 @@
 #![cfg(target_arch = "wasm32")]
+// use bitmask_core::rgb::carbonado::FileMetadata;
+use bitmask_core::carbonado::FileMetadata;
 use bitmask_core::{
     info,
-    structs::FileMetadata,
     web::{
         carbonado::{retrieve, retrieve_metadata, store},
         json_parse, resolve, set_panic_hook,

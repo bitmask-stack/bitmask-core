@@ -4,8 +4,8 @@ use anyhow::{Ok, Result};
 use bitmask_core::{
     info,
     lightning::{
-        auth, check_payment, create_invoice, create_wallet, decode_invoice, get_balance, get_txs,
-        pay_invoice, swap_btc_ln, swap_ln_btc, AuthResponse, CreateWalletResponse, Transaction,
+        AuthResponse, CreateWalletResponse, Transaction, auth, check_payment, create_invoice,
+        create_wallet, decode_invoice, get_balance, get_txs, pay_invoice, swap_btc_ln, swap_ln_btc,
     },
     util::init_logging,
 };

@@ -15,14 +15,24 @@ export const getEnv = async (key: string): Promise<string> =>
 export const setEnv = async (key: string, value: string): Promise<void> =>
   BMC.set_env(key, value);
 
+// Product switch names. Generic signet and regtest are not switchable.
 export enum Network {
   bitcoin = "bitcoin",
-  testnet = "testnet",
-  signet = "signet",
-  regtest = "regtest",
+  testnet3 = "testnet3",
+  testnet4 = "testnet4",
+  mutinynet = "mutinynet",
+  // Same alias as native named_network_from_str: testnet is testnet3.
+  testnet = "testnet3",
 }
 type NetworkType = typeof Network;
 type NetworkKeyType = keyof NetworkType;
+
+export const networkFromStored = (stored: string): Network | undefined => {
+  if (stored === "signet" || stored === "regtest") {
+    return undefined;
+  }
+  return Network[stored as NetworkKeyType];
+};
 
 export const DISABLE_LN =
   process.env?.DISABLE_LN === "true" ? true : false || "";
@@ -34,13 +44,21 @@ export const init = async (networkOverride?: string) => {
   try {
     await initBMC();
 
-    if (networkOverride)
-      window.localStorage.setItem("network", networkOverride);
+    if (networkOverride) {
+      const overrideName = networkFromStored(networkOverride);
+      if (overrideName !== undefined) {
+        window.localStorage.setItem("network", overrideName);
+      }
+    }
     const storedNetwork =
-      networkOverride || window.localStorage.getItem("network");
-    if (storedNetwork) {
-      await switchNetwork(Network[storedNetwork as NetworkKeyType]);
-    } else {
+      (networkOverride && networkFromStored(networkOverride)) ||
+      window.localStorage.getItem("network");
+    const named = storedNetwork
+      ? networkFromStored(storedNetwork)
+      : undefined;
+    if (named !== undefined) {
+      await switchNetwork(named);
+    } else if (!storedNetwork) {
       window.localStorage.setItem("network", Network.bitcoin);
       await switchNetwork(Network.bitcoin);
     }

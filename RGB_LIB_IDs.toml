@@ -3,20 +3,68 @@
 [LIB_ID_RGB]
 # Consensus-breaking: If changed, assets must be reissued
 "urn:ubideco:stl:4fGZWR5mH5zZzRZ1r7CSRe776zm3hLBUngfXc4s3vm3V#saturn-flash-emerald" = "0.6.0-rc.17"
+"urn:ubideco:stl:141hHBYBr2mzKyskZbRuwazYC9ki5x9ZrrzQHLbgBzx#oscar-rufus-tractor" = "0.7.0-rc.2"
+"urn:ubideco:stl:Hzv1xPBtQfqcGYeisvS2V9DPj1VRC5WyYfME2RtmuRpu#blitz-english-eric" = "0.7.0-rc.6"
+"urn:ubideco:stl:py61NAh7V4xHa7if2mF88KL3Z11rUruBNQEAsEqaf2Q#stock-sonata-carlo" = "0.7.0-rc.9"
+"stl:sqbS4Bea-l!IK7Dt-86Fkfgg-NOhi22w-S!kz5bC-l$99W!Y#bless-donald-poker" = "0.7.0-rc.21"
+"stl:ZMTVCU25-QDo98xR-wI91wcu-ydb7kui-QfZbF$n-0KDS2ow#tuna-safari-design" = "0.7.6-beta.2"
+"stl:bioTBozT-NqelHGE-SPbnpMA-XBNSbXZ-6X0dANE-WHVirL8#explain-marvin-bless" = "0.7.6-beta.2"
+"stl:mqltqlPk-O9$pYOd-BACRI70-DOMJ6cp-TFvhcK1-ibrOI9U#import-boxer-seminar" = "0.7.6-beta.2"
+"stl:HffUFU0Z-oNyZXNs-O8u1dRc-Q4Z5mOo-3bqPppu-A0f5iTo#permit-helena-lorenzo" = "0.11.0-beta.7"
+"stl:cpfuZutw-7s$hkuI-Q8vaRf4-XCUiAKC-glMJM!0-8hV0Gvg#monarch-detect-paradox" = "0.11.0-beta.7"
+"stl:kVw2frMA-bnDO3Kj-QWS0pvy-Gak5E$$-U5QFgS7-vzikLJ4#cupid-felix-husband" = "0.11.0-beta.7"
+"stl:qolQpjNB-4ZkpJIo-U1tktjI-mwAYyEg-kOGQttY-ZoK3Loo#colombo-famous-erosion" = "0.11.0-beta.7"
+"stl:fWE3V~d1-l_17zWw-VCqj1TS-1GNiCX3-SgbOSL~-C6m915s#motel-balance-sofia" = "0.11.0-beta.10"
+"stl:dC6XWoqx-WCGR78B-~OSC3eP-Ux7Z4cZ-Xe4Re56-zJrwaDs#loyal-respect-tourist" = "0.11.0-beta.10"
 
 [LIB_ID_RGB_CONTRACT]
 # Interface-only: If changed, only a new interface implementation is needed. No reiussance or migration necessary.
 "urn:ubideco:stl:6vbr9ZrtsD9aBjo5qRQ36QEZPVucqvRRjKCPqE8yPeJr#choice-little-boxer" = "0.6.0-rc.17"
+"urn:ubideco:stl:pGtgmYchjsHEdmKzmkc6SX8rDm4qxN472K8vQyLmNGX#polygon-antonio-violet" = "0.7.0-rc.2"
+"urn:ubideco:stl:F5EUsi6JPh4SyHevD3pm3C5cJbPjR4kAVjrm7atC83W5#evita-weekend-cotton" = "0.7.0-rc.6"
+"urn:ubideco:stl:pvPyTM1N1rG9HEAvvEgqKonnMdakHreYrvGWfFff8q6#atlanta-adrian-sonata" = "0.7.0-rc.8"
+"stl:!r5yXt4a-v3XXv0M-E9Z6eoh-BFZweik-fxS6CB4-8AaO!MM#rover-annual-disney" = "0.7.0-rc.21"
+"stl:fWKPSJqR-PvDeR2v-KRCNxUx-OvrnHDp-!J2rdts-aVKTsnY#copy-current-dilemma" = "0.11.0-beta.7"
+"stl:1uyMC~lT-xPK57Lr-IgIhB0r-WxYd9io-2wZav_s-6TbR4LY#nuclear-liquid-sonic" = "0.11.0-beta.7"
+"stl:BVTW_R~C-ynXP70a-OlhwXa8-SbXktmr-u912vW1-ztIyxhk#mayor-ballet-flood" = "0.11.0-beta.10"
 
 [LIB_ID_RGB20]
 "urn:ubideco:stl:GVz4mvYE94aQ9q2HPtV9VuoppcDdduP54BMKffF7YoFH#prince-scarlet-ringo" = "0.6.0-rc.17"
+"urn:ubideco:stl:pvPyTM1N1rG9HEAvvEgqKonnMdakHreYrvGWfFff8q6#atlanta-adrian-sonata" = "0.7.0-rc.8"
+"stl:!r5yXt4a-v3XXv0M-E9Z6eoh-BFZweik-fxS6CB4-8AaO!MM#rover-annual-disney" = "0.7.0-rc.21"
+"rgb:sch:HnOVUjK8IgpDApgIoHVmMlhjbpDdNxZbWqPwqsi$$ag#broken-elegant-victor" = "0.11.0-beta.7"
+"rgb:sch:RWhwUfTMpuP2Zfx1~j4nswCANGeJrYOqDcKelaMV4zU#remote-digital-pegasus" = "0.11.0-beta.7"
 
 [LIB_ID_RGB21]
 "urn:ubideco:stl:3miGC5GTW58CeuGJgomApmdjm8N6Yu6YuuURS8N4WVBA#opera-cool-bread" = "0.6.0-rc.17"
+"urn:ubideco:stl:3HCD3uDCC2EmGASKnxPaFUCgRBT59SbmJkHjkXh8Ht7B#compare-ship-voodoo" = "0.7.0-rc.2"
+"urn:ubideco:stl:7kUn2VT5xKgZWCAYsa7usNsKWtQBrvyg1pdxRGtendf#tarzan-riviera-vampire" = "0.7.0-rc.6"
+"urn:ubideco:stl:9GETUAH3q2Aw4JSiCzGy4Z8bTuagKQvPa4hH4mDxcX9d#type-economy-shannon" = "0.7.0-rc.8"
+"stl:URVJ768i-moZ15p1-NpCOpOv-E$nZffn-Wq2vgZh-MgmPyPM#omega-cactus-hazard" = "0.7.0-rc.21"
+"rgb:sch:BLmZDuNwtfB0iiji10mrYr!CG0WQOrYrNvr6U!0jLp4#ballad-venice-summer" = "0.11.0-beta.7"
+"rgb:sch:~6rjymf3GTE840lb5JoXm2aFwE8eWCk3mCjOf_mUztE#spider-montana-fantasy" = "0.11.0-beta.7"
 
 [LIB_ID_RGB25]
 "urn:ubideco:stl:4JmGrg7oTgwuCQtyC4ezC38ToHMzgMCVS5kMSDPwo2ee#camera-betty-bank" = "0.6.0-rc.17"
+"urn:ubideco:stl:pvPyTM1N1rG9HEAvvEgqKonnMdakHreYrvGWfFff8q6#atlanta-adrian-sonata" = "0.7.0-rc.8"
+"stl:!r5yXt4a-v3XXv0M-E9Z6eoh-BFZweik-fxS6CB4-8AaO!MM#rover-annual-disney" = "0.7.0-rc.21"
+"rgb:sch:bkjmrau0k8HinYAYs7vsKtHuV9KkdlsNeADBlMd!7cs#torch-puzzle-market" = "0.11.0-beta.7"
+"rgb:sch:JgqK5hJX9YBT4osCV7VcW_iLTcA5csUCnLzvaKTTrNY#mars-house-friend" = "0.11.0-beta.7"
 
 [LIB_ID_RGB_STD]
 # Not consensus-breaking: If changed, only stash and consignments must be updated. No reiussance or migration necessary.
 "urn:ubideco:stl:3KXsWZ6hSKRbPjSVwRGbwnwJp3ZNQ2tfe6QUwLJEDG6K#twist-paul-carlo" = "0.6.0-rc.17"
+"urn:ubideco:stl:GWQoxySX59F4FHGxNdpKN4uKT8bkVyquvk3uz6pyQdP3#profit-escort-karl" = "0.7.0-rc.2"
+"urn:ubideco:stl:DTKsBR7C3omBMsD94cws5moFZofDZ1qtnskM7HELprCf#young-evita-lady" = "0.7.0-rc.6"
+"urn:ubideco:stl:K4PwUS8f7zqaDaKNVF1Cr23grxJwjoZrZZ6sYbrXRL3#market-senior-product" = "0.7.0-rc.8"
+"urn:ubideco:stl:H3hoAebtfhXnFED8rrGJtyDLM3Bpd4FcyosCURo1tWJB#buenos-delta-alex" = "0.7.0-rc.9"
+"stl:hYQHisDw-Xlm3v1j-P7A1VJg-luZS$ja-0AZHFIx-QtWo!SY#carrot-salt-sport" = "0.7.0-rc.21"
+"stl:MRRNRLeI-muTBg22-pcaBEA2-MSllDDH-4RCDD6n-8ku826s#picnic-reverse-convert" = "0.7.6-beta.2"
+"stl:JhUC5JgH-Kwps4cO-ZNUklUj-UP6boFp-OY!18Kx-xOSJaVQ#hair-magnum-helena" = "0.7.6-beta.2"
+"stl:68OpONV0-a6jRyu4-WwnfWw$-NmcHSI0-kpc!Ppp-YBckCAo#lazarus-list-uniform" = "0.11.0-beta.7"
+"stl:MCec0pTS-StBbKEL-eHh0yYz-Ugpf2Qs-ffDfuVp-BeYrsvI#bonanza-triton-andrea" = "0.11.0-beta.7"
+"stl:H!1shJlZ-ktfYRbk-xxiGbLK-SqloZsD-9jJgl$G-H3HEAp4#pulse-active-domino" = "0.11.0-beta.7"
+"stl:LxiMjmBl-MRIFHb1-pitHq43-IPC2~cM-SHQA3hl-mGfDECY#studio-cycle-analyze" = "0.11.0-beta.7"
+"stl:Nn~mJpFH-NvnJbK4-KygN4WE-gZ2qLty-s_BnUXh-HhkGA6I#reverse-diana-mirage" = "0.11.0-beta.10"
+"stl:r1GC~anx-KuJPTuL-5BZ9qof-J2NY2~T-FTYiA6F-Abtg4uU#stick-tornado-absorb" = "0.11.0-beta.10"
+"stl:T4c0yYp2-KWHQ1cm-tHnDKC0-PiE8508-ruJK2fP-EhgRP10#phone-cupid-chicago" = "0.11.0-beta.10"

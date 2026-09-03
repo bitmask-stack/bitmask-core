@@ -1,54 +1,29 @@
 mod rgb {
-
     mod unit {
-        mod amount;
-        mod invoice;
-        mod issue;
-        mod psbt;
-        mod stl;
-        mod stock;
-        pub mod utils;
+        mod auction;
+        mod carbonado;
+        mod chain_net_and_schema_ids;
+        mod networks;
+        mod proxy;
     }
 
-    mod integration {
-        // TODO: Review after support multi-token transfer
-        // mod collectibles;
-        mod accept;
-        mod batch;
-        mod cambria;
-        mod collectibles;
-        mod crdt;
-        mod drain;
-        mod dustless;
-        mod fungibles;
-        mod import;
-        mod inspect;
+    mod server {
+        mod atomic;
         mod issue;
-        mod proxy;
-        mod rbf;
-        mod sign_hash;
-        mod states;
+        mod seeder;
         mod swaps;
         mod transfers;
-        mod udas;
-        pub mod utils;
-        mod watcher;
     }
 
     mod web {
-        mod contracts;
-        mod imports;
-        mod inspect;
-        mod proxy;
-        mod stl_ids;
-        mod stl_load;
+        mod accept;
+        mod data;
+        mod issue;
+        mod keys;
+        mod seeder;
         mod swaps;
-        mod transfers;
+        mod transfer;
         mod utils;
-    }
-
-    mod sre {
-        mod st160;
-        mod st160_web;
+        mod watcher;
     }
 }

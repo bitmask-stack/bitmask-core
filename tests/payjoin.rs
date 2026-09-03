@@ -23,7 +23,7 @@ async fn payjoin() -> Result<()> {
 
     info!("Import wallets");
     let mnemonic = env::var("TEST_WALLET_SEED")?;
-    let hash = hash_password(&SecretString(ENCRYPTION_PASSWORD.to_owned()));
+    let hash = hash_password(&SecretString(ENCRYPTION_PASSWORD.to_owned()))?;
     let encrypted_descriptors = encrypt_wallet(
         &SecretString(mnemonic),
         &hash,
@@ -31,7 +31,7 @@ async fn payjoin() -> Result<()> {
     )
     .await?;
 
-    let vault = decrypt_wallet(&hash, &encrypted_descriptors)?;
+    let vault = decrypt_wallet(&hash, &encrypted_descriptors, &SecretString("".to_owned())).await?;
 
     let wallet = get_wallet_data(
         &SecretString(vault.private.btc_descriptor_xprv.clone()),
@@ -52,6 +52,7 @@ async fn payjoin() -> Result<()> {
         &SecretString(vault.private.btc_change_descriptor_xprv.clone()),
         &destination,
         amount,
+        true,
         Some(1.1),
     )
     .await

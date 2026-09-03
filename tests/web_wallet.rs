@@ -41,7 +41,7 @@ async fn create_wallet() {
     let mnemonic_data: SecretString = json_parse(&mnemonic);
 
     let encrypted_wallet_str: JsValue =
-        resolve(decrypt_wallet(hash, mnemonic_data.0.clone())).await;
+        resolve(decrypt_wallet(hash, mnemonic_data.0.clone(), "".to_owned())).await;
     let encrypted_wallet_data: DecryptedWalletData = json_parse(&encrypted_wallet_str);
 
     assert_eq!(encrypted_wallet_data.mnemonic.split(' ').count(), 24);
@@ -66,7 +66,7 @@ async fn import_and_open_wallet() {
 
     info!("Get encrypted wallet properties");
     let encrypted_wallet_str: JsValue =
-        resolve(decrypt_wallet(hash, mnemonic_data.0.clone())).await;
+        resolve(decrypt_wallet(hash, mnemonic_data.0.clone(), "".to_owned())).await;
     let encrypted_wallet_data: DecryptedWalletData = json_parse(&encrypted_wallet_str);
 
     assert_eq!(
@@ -115,7 +115,12 @@ async fn import_test_wallet() {
     let mnemonic_data: SecretString = json_parse(&mnemonic_data_str);
 
     info!("Get vault properties");
-    let vault_str: JsValue = resolve(decrypt_wallet(hash0.clone(), mnemonic_data.0.clone())).await;
+    let vault_str: JsValue = resolve(decrypt_wallet(
+        hash0.clone(),
+        mnemonic_data.0.clone(),
+        "".to_owned(),
+    ))
+    .await;
     let _encrypted_wallet_data: DecryptedWalletData = json_parse(&vault_str);
 
     info!("Import wallet once more");
@@ -131,7 +136,12 @@ async fn import_test_wallet() {
     let mnemonic_data: SecretString = json_parse(&mnemonic_data_str);
 
     info!("Get vault properties");
-    let vault_str: JsValue = resolve(decrypt_wallet(hash1, mnemonic_data.0.clone())).await;
+    let vault_str: JsValue = resolve(decrypt_wallet(
+        hash1,
+        mnemonic_data.0.clone(),
+        "".to_owned(),
+    ))
+    .await;
     let encrypted_wallet_data: DecryptedWalletData = json_parse(&vault_str);
 
     info!("Get wallet data");
@@ -181,6 +191,7 @@ async fn import_test_wallet() {
             .clone(),
         wallet_data.address,
         1_000,
+        true,
         Some(1.1),
     ))
     .await;

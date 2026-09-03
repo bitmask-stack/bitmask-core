@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
-use bech32::{decode, encode, FromBase32, ToBase32, Variant};
-
+use bech32::{FromBase32, ToBase32, Variant, decode, encode};
 #[cfg(not(target_arch = "wasm32"))]
 use reqwest::multipart::Form;
 
@@ -99,6 +98,7 @@ pub async fn get(url: &str, token: Option<&str>) -> Result<String> {
         "Error in parsing server response for GET request to {url}"
     ))?;
 
+    debug!(format!("rgb-proxy.get 9 {response_text}"));
     Ok(response_text)
 }
 
@@ -168,6 +168,7 @@ pub async fn upload_data(url: &str, form: Form) -> Result<(String, u16)> {
         "Error in parsing server response for POST JSON request to {url}"
     ))?;
 
+    debug!(format!("rgb-proxy.post ({status_code}) - {response_text}"));
     Ok((response_text, status_code))
 }
 
@@ -188,6 +189,7 @@ pub async fn post_data(url: &str, form: Form) -> Result<(String, u16)> {
         "Error in parsing server response for POST JSON request to {url}"
     ))?;
 
+    debug!(format!("rgb-proxy.get ({status_code}) - {response_text}"));
     Ok((response_text, status_code))
 }
 
@@ -251,7 +253,7 @@ pub const RAW_DATA_ENCODING_DEFLATE: u8 = 1u8;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn bech32m_zip_encode(hrp: &str, bytes: &[u8]) -> Result<String> {
-    use deflate::{write::DeflateEncoder, Compression};
+    use deflate::{Compression, write::DeflateEncoder};
     use std::io::Write;
 
     // We initialize writer with a version byte, indicating deflation
@@ -269,7 +271,7 @@ pub fn bech32m_zip_decode(bech32_str: &str) -> Result<Vec<u8>> {
     use anyhow::anyhow;
 
     let (_, data, _) = bech32_decode(bech32_str)?;
-    match *data[..].first().unwrap() {
+    match *data[..].first().unwrap_or(&0_u8) {
         RAW_DATA_ENCODING_DEFLATE => {
             let decoded = inflate::inflate_bytes(&data[1..]).map_err(|e| anyhow!(e))?;
             Ok(decoded)
@@ -288,13 +290,17 @@ pub fn init_logging(default: &str) {
     use std::env;
 
     if env::var("RUST_LOG").is_err() {
-        env::set_var(
-            "RUST_LOG",
-            format!("bitmask_core=warn,bitmask_core::operations::rgb=warn,{default}"),
-        );
+        // SAFETY: single-threaded test setup before the logger starts.
+        unsafe {
+            env::set_var("RUST_LOG", format!("bitmask_core=warn,{default}"));
+        }
     }
 
     let _ = pretty_env_logger::formatted_builder()
         .is_test(true)
         .try_init();
+}
+
+pub mod built_info {
+    include!(concat!(env!("OUT_DIR"), "/built.rs"));
 }

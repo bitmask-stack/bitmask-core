@@ -1,16 +1,14 @@
 use std::str::FromStr;
 
-use ::bitcoin::util::address::Address;
-use ::psbt::Psbt;
 use amplify::hex::ToHex;
 use argon2::Argon2;
-use bdk::{wallet::AddressIndex, FeeRate, LocalUtxo, SignOptions, TransactionDetails};
-use bitcoin::{consensus::encode, psbt::PartiallySignedTransaction, Txid};
-use rand::{rngs::StdRng, Rng, SeedableRng};
-use serde_encrypt::{
-    serialize::impls::BincodeSerializer, shared_key::SharedKey, traits::SerdeEncryptSharedKey,
-    AsSharedKey, EncryptedMessage,
-};
+use bdk_wallet::bitcoin::{FeeRate, Network, Txid, address::NetworkUnchecked, psbt::Psbt};
+use bdk_wallet::chain::{ChainPosition, ConfirmationBlockTime};
+use bdk_wallet::{LocalOutput, SignOptions};
+use bitcoin::Address;
+use bitcoin::consensus::serialize;
+use bpstd::Tx;
+use rand::{Rng, SeedableRng, rngs::StdRng};
 use thiserror::Error;
 use zeroize::Zeroize;
 
@@ -19,43 +17,41 @@ mod keys;
 mod payment;
 mod psbt;
 mod wallet;
+mod wallet_encrypt;
+
+use crate::bitcoin::wallet_encrypt::{
+    EncryptedMessage, WalletEncryptError, decrypt_owned, encrypt_owned,
+};
 
 pub use crate::bitcoin::{
     assets::dust_tx,
-    keys::{new_mnemonic, save_mnemonic, BitcoinKeysError},
-    payment::{create_payjoin, create_transaction, BitcoinPaymentError},
+    keys::{BitcoinKeysError, get_mnemonic, new_mnemonic, save_mnemonic},
+    payment::{BitcoinPaymentError, create_payjoin, create_transaction},
     psbt::{
-        multi_sign_and_publish_psbt, multi_sign_psbt, publish_psbt, sign_and_publish_psbt,
-        sign_psbt, BitcoinPsbtError,
+        BitcoinPsbtError, multi_sign_and_publish_psbt, multi_sign_psbt, publish_psbt,
+        sign_and_publish_psbt, sign_psbt,
     },
     wallet::{
-        get_blockchain, get_wallet, sync_wallet, sync_wallets, BitcoinWalletError, MemoryWallet,
+        BitcoinWalletError, MemoryWallet, get_blockchain, get_wallet, sync_wallet, sync_wallets,
     },
 };
 
+use crate::constants::BITCOIN_EXPLORER_API;
 use crate::{
-    bitcoin::keys::get_marketplace_descriptor,
-    constants::{DIBA_DESCRIPTOR, DIBA_DESCRIPTOR_VERSION, DIBA_MAGIC_NO, NETWORK},
+    constants::{DIBA_DESCRIPTOR, DIBA_DESCRIPTOR_VERSION, DIBA_MAGIC_NO, FEE_ADDRESS, NETWORK},
     debug, info,
     structs::{
-        DecryptedWalletData, EncryptedWalletDataV04, FundVaultDetails, PublishPsbtRequest,
-        PublishedPsbtResponse, SatsInvoice, SecretString, SignPsbtRequest, SignedPsbtResponse,
-        TransactionData, WalletData, WalletTransaction,
+        Balance, BlockTime, DecryptedWalletData, EncryptedWalletDataV04, FundVaultDetails,
+        PublishPsbtRequest, PublishedPsbtResponse, SatsInvoice, SecretString, SignPsbtRequest,
+        SignedPsbtResponse, TransactionData, TransactionDetails, WalletData, WalletTransaction,
     },
     trace,
 };
 
 // Minimum amount of satoshis to funding vault
-const MIN_FUNDS_SATS: u64 = 10000;
+pub const MIN_FUNDS_SATS: u64 = 10000;
 
-impl SerdeEncryptSharedKey for DecryptedWalletData {
-    type S = BincodeSerializer<Self>;
-}
-
-impl SerdeEncryptSharedKey for EncryptedWalletDataV04 {
-    type S = BincodeSerializer<Self>;
-}
-
+#[allow(clippy::result_large_err)] // product Bitcoin Result graph; do not reshape
 #[derive(Error, Debug)]
 pub enum BitcoinError {
     /// Wrong Encrypted Descriptor Format
@@ -74,6 +70,8 @@ pub enum BitcoinError {
     /// Wrong network
     #[error("Address provided is on the wrong network!")]
     WrongNetwork,
+    #[error("Wrong Psbt: PSBT hexadecimal cannot be parsed")]
+    WrongPsbt,
     /// Wrong Encrypted Descriptor Format
     #[error("Insufficient satoshis to create funding wallet. Minimum: {0} sats")]
     InsufficientFundSats(u64),
@@ -98,30 +96,75 @@ pub enum BitcoinError {
     /// hex decode error
     #[error(transparent)]
     HexDecodeError(#[from] hex::FromHexError),
-    /// serde encrypt error
+    /// Wallet descriptor encrypt/decrypt (XChaCha20-Poly1305 + bincode)
     #[error(transparent)]
-    SerdeEncryptError(#[from] serde_encrypt::Error),
-    /// BDK error
-    #[error(transparent)]
-    BdkError(#[from] bdk::Error),
+    WalletEncryptError(#[from] WalletEncryptError),
+    /// BDK create-tx error
+    #[error("BDK create tx: {0}")]
+    BdkCreateTxError(String),
+    /// BDK signer error
+    #[error("BDK sign: {0}")]
+    BdkSignError(String),
+    /// BDK fee-bump error
+    #[error("BDK fee bump: {0}")]
+    BdkFeeBumpError(String),
     /// BDK esplora error
     #[error(transparent)]
-    BdkEsploraError(#[from] bdk::esplora_client::Error),
-    /// Bitcoin address error
+    BdkEsploraError(#[from] bdk_esplora::esplora_client::Error),
+    /// Bitcoin address parse
     #[error(transparent)]
-    BitcoinAddressError(#[from] bitcoin::util::address::Error),
-    /// PSBT decode error
-    #[error(transparent)]
-    BitcoinPsbtDecodeError(#[from] bitcoin::consensus::encode::Error),
+    BitcoinAddressError(#[from] bitcoin::address::ParseError),
+    /// PSBT extract
+    #[error("PSBT extract tx: {0}")]
+    BitcoinPsbtExtractError(String),
     /// Txid parse error
     #[error(transparent)]
-    TxidParseError(#[from] bitcoin::hashes::hex::Error),
+    TxidParseError(#[from] bitcoin::hex::HexToArrayError),
+    #[error("Password hashed with Argon2id: {0}")]
+    HashPasswordError(String),
+    #[error("Shared key hash must be of fixed size: {0}")]
+    SharedKeyError(String),
+    #[error("No fee present on tx")]
+    NoFeePresent,
+    #[error("Fee low. Please increase the fee rate and try again.")]
+    FeeLow,
+    #[error("Failed to build esplora client: {0}")]
+    BuildEsploraError(String),
 }
 
 /// Bitcoin Wallet Operations
 const BITMASK_ARGON2_SALT: &[u8] = b"DIBA BitMask Password Hash"; // Never change this
 
-pub fn hash_password(password: &SecretString) -> SecretString {
+/// Convert product `f32` sat/vB to rust-bitcoin 0.32 `FeeRate`.
+pub fn fee_rate_from_sat_vb(sat_vb: f32) -> FeeRate {
+    let v = if sat_vb.is_finite() && sat_vb > 0.0 {
+        sat_vb.ceil() as u64
+    } else {
+        1
+    };
+    FeeRate::from_sat_per_vb(v.max(1)).expect("non-zero sat/vB is a valid FeeRate")
+}
+
+fn product_balance(balance: bdk_wallet::Balance) -> Balance {
+    Balance {
+        immature: balance.immature.to_sat(),
+        trusted_pending: balance.trusted_pending.to_sat(),
+        untrusted_pending: balance.untrusted_pending.to_sat(),
+        confirmed: balance.confirmed.to_sat(),
+    }
+}
+
+fn product_block_time(pos: ChainPosition<ConfirmationBlockTime>) -> Option<BlockTime> {
+    match pos {
+        ChainPosition::Confirmed { anchor, .. } => Some(BlockTime {
+            height: anchor.block_id.height,
+            timestamp: anchor.confirmation_time,
+        }),
+        ChainPosition::Unconfirmed { .. } => None,
+    }
+}
+
+pub fn hash_password(password: &SecretString) -> Result<SecretString, BitcoinError> {
     use argon2::{Algorithm, Params, Version};
 
     let mut output_key_material = [0u8; 32];
@@ -131,20 +174,23 @@ pub fn hash_password(password: &SecretString) -> SecretString {
             BITMASK_ARGON2_SALT,
             &mut output_key_material,
         )
-        .expect("Password hashed with Argon2id");
+        .map_err(|e| BitcoinError::HashPasswordError(e.to_string()))?;
 
     let hash = SecretString(hex::encode(output_key_material));
     output_key_material.zeroize();
-    hash
+
+    Ok(hash)
 }
 
-pub fn decrypt_wallet(
+pub async fn decrypt_wallet(
     hash: &SecretString,
     encrypted_descriptors: &SecretString,
+    seed_password: &SecretString,
 ) -> Result<DecryptedWalletData, BitcoinError> {
-    let mut shared_key: [u8; 32] = hex::decode(&hash.0)?
-        .try_into()
-        .expect("hash is of fixed size");
+    let mut shared_key: [u8; 32] = match hex::decode(&hash.0)?.try_into() {
+        Ok(key) => key,
+        Err(e) => return Err(BitcoinError::SharedKeyError(format!("{:?}", e))),
+    };
     let encrypted_descriptors: Vec<u8> = hex::decode(&encrypted_descriptors.0)?;
     let (version_prefix, encrypted_descriptors) = encrypted_descriptors.split_at(5);
 
@@ -162,10 +208,13 @@ pub fn decrypt_wallet(
 
     let encrypted_message = EncryptedMessage::deserialize(encrypted_descriptors.to_owned())?;
 
-    let decrypted_wallet_data =
-        DecryptedWalletData::decrypt_owned(&encrypted_message, &SharedKey::from_array(shared_key))?;
+    let decrypted_wallet_data: DecryptedWalletData =
+        decrypt_owned(&encrypted_message, &shared_key)?;
 
     shared_key.zeroize();
+
+    let mnemonic_phrase = &SecretString(decrypted_wallet_data.mnemonic.clone());
+    let decrypted_wallet_data = save_mnemonic(mnemonic_phrase, seed_password).await?;
 
     Ok(decrypted_wallet_data)
 }
@@ -175,22 +224,19 @@ pub async fn upgrade_wallet(
     encrypted_descriptors: &SecretString,
     seed_password: &SecretString,
 ) -> Result<SecretString, BitcoinError> {
-    // read hash digest and consume hasher
-    let shared_key: [u8; 32] = hex::decode(&hash.0)?
-        .try_into()
-        .expect("hash is of fixed size");
+    let shared_key: [u8; 32] = match hex::decode(&hash.0)?.try_into() {
+        Ok(key) => key,
+        Err(e) => return Err(BitcoinError::SharedKeyError(format!("{:?}", e))),
+    };
     let encrypted_descriptors: Vec<u8> = hex::decode(&encrypted_descriptors.0)?;
     let encrypted_message = EncryptedMessage::deserialize(encrypted_descriptors)?;
 
-    match DecryptedWalletData::decrypt_owned(&encrypted_message, &SharedKey::from_array(shared_key))
-    {
+    match decrypt_owned::<DecryptedWalletData>(&encrypted_message, &shared_key) {
         Ok(_data) => Err(BitcoinError::UpgradeUnnecessary),
         Err(_err) => {
-            // If there's a deserialization error, attempt to recover just the mnemnonic.
-            let recovered_wallet_data = EncryptedWalletDataV04::decrypt_owned(
-                &encrypted_message,
-                &SharedKey::from_array(shared_key),
-            )?;
+            // If there's a deserialization error, attempt to recover just the mnemonic.
+            let recovered_wallet_data: EncryptedWalletDataV04 =
+                decrypt_owned(&encrypted_message, &shared_key)?;
 
             // println!("Recovered wallet data: {recovered_wallet_data:?}"); // Keep commented out for security
             // todo!("Add later version migrations here");
@@ -223,14 +269,17 @@ pub async fn new_wallet(
     hash: &SecretString,
     seed_password: &SecretString,
 ) -> Result<SecretString, BitcoinError> {
-    let mut shared_key: [u8; 32] = hex::decode(&hash.0)?
-        .try_into()
-        .expect("hash is of fixed size");
+    let mut shared_key: [u8; 32] = match hex::decode(&hash.0)?.try_into() {
+        Ok(key) => key,
+        Err(e) => return Err(BitcoinError::SharedKeyError(format!("{:?}", e))),
+    };
+
     let wallet_data = new_mnemonic(seed_password).await?;
-    let encrypted_message = wallet_data.encrypt(&SharedKey::from_array(shared_key))?;
+    let encrypted_message = encrypt_owned(&wallet_data, &shared_key)?;
     let encrypted_descriptors = versioned_descriptor(encrypted_message);
 
     shared_key.zeroize();
+
     Ok(encrypted_descriptors)
 }
 
@@ -239,13 +288,15 @@ pub async fn encrypt_wallet(
     hash: &SecretString,
     seed_password: &SecretString,
 ) -> Result<SecretString, BitcoinError> {
-    let shared_key: [u8; 32] = hex::decode(&hash.0)?
-        .try_into()
-        .expect("hash is of fixed size");
+    let shared_key: [u8; 32] = match hex::decode(&hash.0)?.try_into() {
+        Ok(key) => key,
+        Err(e) => return Err(BitcoinError::SharedKeyError(format!("{:?}", e))),
+    };
 
     let wallet_data = save_mnemonic(mnemonic_phrase, seed_password).await?;
-    let encrypted_message = wallet_data.encrypt(&SharedKey::from_array(shared_key))?;
+    let encrypted_message = encrypt_owned(&wallet_data, &shared_key)?;
     let encrypted_descriptors = versioned_descriptor(encrypted_message);
+
     Ok(encrypted_descriptors)
 }
 
@@ -258,23 +309,43 @@ pub async fn get_wallet_data(
     let wallet = get_wallet(descriptor, change_descriptor).await?;
     sync_wallet(&wallet).await?;
 
-    let address = wallet
+    let address = {
+        let mut w = wallet.lock().await;
+        crate::bitcoin::wallet::next_unused_receive_address(&mut w)
+    };
+    info!(format!("address: {address}"));
+    let balance = product_balance(wallet.lock().await.balance());
+    info!(format!("balance: {balance:?}"));
+    let utxos: Vec<String> = wallet
         .lock()
         .await
-        .get_address(AddressIndex::LastUnused)?
-        .to_string();
-    info!(format!("address: {address}"));
-    let balance = wallet.lock().await.get_balance()?;
-    info!(format!("balance: {balance:?}"));
-    let utxos = wallet.lock().await.list_unspent().unwrap_or_default();
-    let utxos: Vec<String> = utxos.into_iter().map(|x| x.outpoint.to_string()).collect();
+        .list_unspent()
+        .map(|x| x.outpoint.to_string())
+        .collect();
     trace!(format!("unspent: {utxos:#?}"));
 
-    let mut transactions = wallet
-        .lock()
-        .await
-        .list_transactions(true)
-        .unwrap_or_default();
+    let mut transactions: Vec<WalletTransaction> = {
+        let w = wallet.lock().await;
+        w.transactions()
+            .filter_map(|wtx| {
+                let tx = wtx.tx_node.tx.as_ref();
+                let vsize = tx.vsize().max(1);
+                let fee = w.calculate_fee(tx).ok().map(|a| a.to_sat())?;
+                let (sent, received) = w.sent_and_received(tx);
+                let confirmation_time = product_block_time(wtx.chain_position);
+                Some(WalletTransaction {
+                    txid: tx.compute_txid(),
+                    received: received.to_sat(),
+                    sent: sent.to_sat(),
+                    fee: Some(fee),
+                    confirmed: confirmation_time.is_some(),
+                    confirmation_time,
+                    vsize,
+                    fee_rate: fee as f32 / vsize as f32,
+                })
+            })
+            .collect()
+    };
     trace!(format!("transactions: {transactions:#?}"));
 
     transactions.sort_by(|a, b| {
@@ -283,28 +354,6 @@ pub async fn get_wallet_data(
             .map(|t| t.height)
             .cmp(&a.confirmation_time.as_ref().map(|t| t.height))
     });
-
-    let transactions: Vec<WalletTransaction> = transactions
-        .into_iter()
-        .map(|tx| {
-            let vsize = match &tx.transaction {
-                Some(tx_details) => tx_details.vsize(),
-                None => 1,
-            };
-            let fee_rate = tx.fee.expect("tx fee exists") as f32 / vsize as f32;
-
-            WalletTransaction {
-                txid: tx.txid,
-                received: tx.received,
-                sent: tx.sent,
-                fee: tx.fee,
-                confirmed: tx.confirmation_time.is_some(),
-                confirmation_time: tx.confirmation_time,
-                vsize,
-                fee_rate,
-            }
-        })
-        .collect();
 
     trace!(format!("transactions: {transactions:#?}"));
 
@@ -316,18 +365,6 @@ pub async fn get_wallet_data(
     })
 }
 
-pub async fn get_swap_new_address() -> Result<Option<String>, BitcoinError> {
-    info!("get_swap_new_address");
-
-    let markplace_desc = get_marketplace_descriptor().await?;
-    if let Some(markplace_desc) = markplace_desc {
-        let address = get_new_address(&markplace_desc, None).await?;
-        return Ok(Some(address));
-    }
-
-    Ok(None)
-}
-
 pub async fn get_new_address(
     descriptor: &SecretString,
     change_descriptor: Option<&SecretString>,
@@ -335,17 +372,37 @@ pub async fn get_new_address(
     info!("get_new_address");
 
     let wallet = get_wallet(descriptor, change_descriptor).await?;
-    let address = wallet.lock().await.get_address(AddressIndex::New)?;
+    let address = {
+        let mut w = wallet.lock().await;
+        crate::bitcoin::wallet::reveal_next_receive_address(&mut w)
+    };
     info!(format!("address: {address}"));
-    Ok(address.to_string())
+    Ok(address)
 }
 
-pub async fn validate_address(address: &Address) -> Result<(), BitcoinError> {
-    if address.network != *NETWORK.read().await {
-        Err(BitcoinError::WrongNetwork)
-    } else {
-        Ok(())
+pub async fn validate_address(address: &Address<NetworkUnchecked>) -> Result<(), BitcoinError> {
+    let network = *NETWORK.read().await;
+    match network {
+        Network::Signet => {
+            if !address.is_valid_for_network(Network::Signet)
+                && !address.is_valid_for_network(Network::Testnet)
+            {
+                return Err(BitcoinError::WrongNetwork);
+            }
+        }
+        other => {
+            if !address.is_valid_for_network(other) {
+                return Err(BitcoinError::WrongNetwork);
+            }
+        }
     }
+    Ok(())
+}
+
+async fn parse_checked_address(s: &str) -> Result<Address, BitcoinError> {
+    let unchecked = Address::from_str(s)?;
+    validate_address(&unchecked).await?;
+    Ok(unchecked.assume_checked())
 }
 
 pub async fn send_sats(
@@ -353,33 +410,52 @@ pub async fn send_sats(
     change_descriptor: &SecretString,
     destination: &str, // bip21 uri or address
     amount: u64,
+    broadcast: bool,
     fee_rate: Option<f32>,
 ) -> Result<TransactionData, BitcoinError> {
-    use payjoin::UriExt;
-
     let wallet = get_wallet(descriptor, Some(change_descriptor)).await?;
-    let fee_rate = fee_rate.map(FeeRate::from_sat_per_vb);
+    let fee_rate = fee_rate.map(fee_rate_from_sat_vb);
 
     let details = match payjoin::Uri::try_from(destination) {
         Ok(uri) => {
-            let address = uri.address.clone();
-            validate_address(&address).await?;
+            let uri = uri.assume_checked();
+            let address = parse_checked_address(&uri.address().to_string()).await?;
             if let Ok(pj_uri) = uri.check_pj_supported() {
                 create_payjoin(
-                    vec![SatsInvoice { address, amount }],
+                    vec![SatsInvoice {
+                        address: address.clone().into_unchecked(),
+                        amount,
+                    }],
                     &wallet,
                     fee_rate,
                     pj_uri,
                 )
                 .await?
             } else {
-                create_transaction(vec![SatsInvoice { address, amount }], &wallet, fee_rate).await?
+                create_transaction(
+                    vec![SatsInvoice {
+                        address: address.into_unchecked(),
+                        amount,
+                    }],
+                    &wallet,
+                    broadcast,
+                    fee_rate,
+                )
+                .await?
             }
         }
         _ => {
-            let address = Address::from_str(destination)?;
-            validate_address(&address).await?;
-            create_transaction(vec![SatsInvoice { address, amount }], &wallet, fee_rate).await?
+            let address = parse_checked_address(destination).await?;
+            create_transaction(
+                vec![SatsInvoice {
+                    address: address.into_unchecked(),
+                    amount,
+                }],
+                &wallet,
+                broadcast,
+                fee_rate,
+            )
+            .await?
         }
     };
 
@@ -387,7 +463,13 @@ pub async fn send_sats(
         Some(tx_details) => tx_details.vsize(),
         None => 1,
     };
-    let fee_rate = details.fee.expect("fee is present on tx") as f32 / vsize as f32;
+
+    let fee_rate = match details.fee {
+        Some(fee) => fee,
+        None => return Err(BitcoinError::NoFeePresent),
+    };
+
+    let fee_rate = fee_rate as f32 / vsize as f32;
 
     Ok(TransactionData {
         details,
@@ -399,99 +481,102 @@ pub async fn send_sats(
 pub async fn fund_vault(
     btc_descriptor_xprv: &SecretString,
     btc_change_descriptor_xprv: &SecretString,
-    assets_address_1: &str,
-    uda_address_1: &str,
+    rgb_address: &str,
+    broadcast: bool,
     fee_rate: Option<f32>,
 ) -> Result<FundVaultDetails, BitcoinError> {
     let wallet = get_wallet(btc_descriptor_xprv, Some(btc_change_descriptor_xprv)).await?;
-    let fee_rate = fee_rate.map(FeeRate::from_sat_per_vb);
+    let fee_rate = fee_rate.map(fee_rate_from_sat_vb);
 
-    let balance = wallet.lock().await.get_balance()?;
+    let balance = product_balance(wallet.lock().await.balance());
     if balance.confirmed < MIN_FUNDS_SATS {
         return Err(BitcoinError::InsufficientFundSats(MIN_FUNDS_SATS));
     };
 
-    let assets_address_1 = Address::from_str(assets_address_1)?;
-    let uda_address_1 = Address::from_str(uda_address_1)?;
+    let rgb_address = parse_checked_address(rgb_address).await?;
+    let fee_address = Address::from_str(FEE_ADDRESS)?.assume_checked();
 
     let mut rng = StdRng::from_entropy();
+    let dust_amount = rng.gen_range(589..1515);
+    let fee_amount = rng.gen_range(10_101..11_511);
 
-    let asset_invoice_1 = SatsInvoice {
-        address: assets_address_1,
-        amount: rng.gen_range(600..1500),
-    };
-    let uda_invoice_1 = SatsInvoice {
-        address: uda_address_1,
-        amount: rng.gen_range(600..1500),
+    let invoice = SatsInvoice {
+        address: rgb_address.into_unchecked(),
+        amount: dust_amount,
     };
 
-    let asset_tx_details =
-        create_transaction(vec![asset_invoice_1, uda_invoice_1], &wallet, fee_rate).await?;
+    let mut invoices = vec![invoice];
+
+    if *NETWORK.read().await == Network::Bitcoin {
+        let fee = SatsInvoice {
+            address: fee_address.into_unchecked(),
+            amount: fee_amount,
+        };
+        invoices.push(fee);
+    }
+
+    let asset_tx_details = create_transaction(invoices, &wallet, broadcast, fee_rate).await?;
 
     let asset_txid = asset_tx_details.txid;
 
     info!(format!("asset txid: {asset_txid}"));
+    info!(format!("asset details: {asset_tx_details:?}"));
 
-    let asset_outputs: Vec<String> = asset_tx_details
-        .transaction
-        .expect("asset tx should exist but doesn't")
-        .output
-        .iter()
-        .enumerate()
-        .map(|(i, _)| format!("{asset_txid}:{i}"))
-        .collect();
+    let rgb_output = if broadcast {
+        asset_tx_details.transaction.as_ref().and_then(|tx| {
+            tx.output
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("{asset_txid}:{i}"))
+                .collect::<Vec<String>>()
+                .first()
+                .map(|o| o.to_owned())
+        })
+    } else {
+        None
+    };
 
-    let assets_output = Some(asset_outputs[0].to_owned());
-    let udas_output = Some(asset_outputs[1].to_owned());
+    let cost = dust_amount + fee_amount + 2336;
+    let fund_fee = asset_tx_details.fee.map(|f| f as u32 + cost as u32);
 
     Ok(FundVaultDetails {
-        assets_output,
-        udas_output,
-        is_funded: true,
-        fund_txid: Some(asset_txid.to_hex()),
+        rgb_output,
+        is_funded: broadcast,
+        fund_txid: Some(asset_txid.to_string()),
+        fund_fee,
     })
 }
 
-fn utxo_string(utxo: &LocalUtxo) -> String {
+fn utxo_string(utxo: &LocalOutput) -> String {
     utxo.outpoint.to_string()
 }
 
 pub async fn get_assets_vault(
-    rgb_assets_descriptor_xpub: &SecretString,
-    rgb_udas_descriptor_xpub: &SecretString,
+    rgb_descriptor_xpub: &SecretString,
 ) -> Result<FundVaultDetails, BitcoinError> {
-    let assets_wallet = get_wallet(rgb_assets_descriptor_xpub, None).await?;
-    let udas_wallet = get_wallet(rgb_udas_descriptor_xpub, None).await?;
+    let rgb_wallet = get_wallet(rgb_descriptor_xpub, None).await?;
 
-    let assets_utxos = assets_wallet.lock().await.list_unspent()?;
-    let uda_utxos = udas_wallet.lock().await.list_unspent()?;
+    let rgb_utxos: Vec<LocalOutput> = rgb_wallet.lock().await.list_unspent().collect();
+    debug!(format!("RGB UTXOs: {rgb_utxos:#?}"));
 
-    debug!(format!("Asset UTXOs: {assets_utxos:#?}"));
-    debug!(format!("UDA UTXOs: {uda_utxos:#?}"));
+    let mut rgb_utxos: Vec<String> = rgb_utxos.iter().map(utxo_string).collect();
+    rgb_utxos.sort();
 
-    let mut assets_utxos: Vec<String> = assets_utxos.iter().map(utxo_string).collect();
-    assets_utxos.sort();
+    let rgb_output = rgb_utxos.pop();
 
-    let mut uda_utxos: Vec<String> = uda_utxos.iter().map(utxo_string).collect();
-    uda_utxos.sort();
+    let is_funded = rgb_output.is_some();
 
-    let assets_output = assets_utxos.pop();
-    let udas_output = uda_utxos.pop();
-
-    let is_funded = assets_output.is_some() && udas_output.is_some();
     Ok(FundVaultDetails {
-        assets_output,
-        udas_output,
+        rgb_output,
         is_funded,
         fund_txid: None,
+        fund_fee: None,
     })
 }
 
 pub async fn sign_psbt_file(request: SignPsbtRequest) -> Result<SignedPsbtResponse, BitcoinError> {
     let SignPsbtRequest { psbt, descriptors } = request;
-
-    let original_psbt = Psbt::from_str(&psbt)?;
-    let final_psbt = PartiallySignedTransaction::from(original_psbt);
+    let final_psbt = Psbt::from_str(&psbt).map_err(|_| BitcoinError::WrongPsbt)?;
 
     let mut wallets = vec![];
     for descriptor in descriptors {
@@ -500,12 +585,10 @@ pub async fn sign_psbt_file(request: SignPsbtRequest) -> Result<SignedPsbtRespon
     }
 
     let psbt_signed = multi_sign_psbt(wallets, final_psbt).await?;
-
-    let psbt_bytes = encode::serialize(&psbt_signed);
-    let psbt_hex = psbt_bytes.to_hex();
+    let psbt_b64 = psbt_signed.to_string();
     Ok(SignedPsbtResponse {
         sign: true,
-        psbt: psbt_hex,
+        psbt: psbt_b64,
     })
 }
 
@@ -513,16 +596,13 @@ pub async fn publish_psbt_file(
     request: PublishPsbtRequest,
 ) -> Result<SignedPsbtResponse, BitcoinError> {
     let PublishPsbtRequest { psbt } = request;
-
-    let original_psbt = Psbt::from_str(&psbt)?;
-    let final_psbt = PartiallySignedTransaction::from(original_psbt);
+    let final_psbt = Psbt::from_str(&psbt).map_err(|_| BitcoinError::WrongPsbt)?;
 
     publish_psbt(final_psbt.clone()).await?;
-    let psbt_bytes = encode::serialize(&final_psbt);
-    let psbt_hex = psbt_bytes.to_hex();
+    let psbt_b64 = final_psbt.to_string();
     Ok(SignedPsbtResponse {
         sign: true,
-        psbt: psbt_hex,
+        psbt: psbt_b64,
     })
 }
 
@@ -530,9 +610,7 @@ pub async fn sign_and_publish_psbt_file(
     request: SignPsbtRequest,
 ) -> Result<PublishedPsbtResponse, BitcoinError> {
     let SignPsbtRequest { psbt, descriptors } = request;
-
-    let original_psbt = Psbt::from_str(&psbt)?;
-    let final_psbt = PartiallySignedTransaction::from(original_psbt);
+    let final_psbt = Psbt::from_str(&psbt).map_err(|_| BitcoinError::WrongPsbt)?;
 
     let mut wallets = vec![];
     for descriptor in descriptors {
@@ -544,7 +622,7 @@ pub async fn sign_and_publish_psbt_file(
     let resp = match sign.transaction {
         Some(tx) => PublishedPsbtResponse {
             sign: true,
-            txid: tx.txid().to_string(),
+            txid: tx.compute_txid().to_string(),
         },
         _ => PublishedPsbtResponse {
             sign: false,
@@ -555,60 +633,139 @@ pub async fn sign_and_publish_psbt_file(
     Ok(resp)
 }
 
+pub async fn publish_psbt_file_bp(
+    request: PublishPsbtRequest,
+) -> Result<SignedPsbtResponse, BitcoinError> {
+    let PublishPsbtRequest { psbt } = request;
+    let final_psbt = Psbt::from_str(&psbt).map_err(|_| BitcoinError::WrongPsbt)?;
+    let tx_hex = &serialize(
+        &final_psbt
+            .clone()
+            .extract_tx()
+            .map_err(|e| BitcoinError::BitcoinPsbtExtractError(e.to_string()))?,
+    )
+    .to_hex();
+    debug!(format!("tx: {tx_hex}"));
+    let tx = Tx::from_str(tx_hex).map_err(|_| BitcoinError::WrongPsbt)?;
+
+    let esplora_url = BITCOIN_EXPLORER_API.read().await.to_string();
+    let esplora_client = esplora::Builder::new(&esplora_url)
+        .build_async()
+        .map_err(|e| BitcoinError::BuildEsploraError(e.to_string()))?;
+
+    esplora_client.broadcast(&tx).await.map_err(|op| {
+        BitcoinError::BitcoinPsbtError(BitcoinPsbtError::CouldNotBroadcastPsbt(op.to_string()))
+    })?;
+
+    let psbt_b64 = final_psbt.to_string();
+    Ok(SignedPsbtResponse {
+        sign: true,
+        psbt: psbt_b64,
+    })
+}
+
+pub async fn sign_and_publish_psbt_file_bp(
+    request: SignPsbtRequest,
+) -> Result<PublishedPsbtResponse, BitcoinError> {
+    let SignPsbtRequest { psbt, descriptors } = request;
+    let final_psbt = Psbt::from_str(&psbt).map_err(|_| BitcoinError::WrongPsbt)?;
+
+    let mut wallets = vec![];
+    for descriptor in descriptors {
+        let wallet = get_wallet(&descriptor, None).await?;
+        wallets.push(wallet);
+    }
+
+    let psbt_signed = multi_sign_psbt(wallets, final_psbt).await?;
+    let tx_hex = &serialize(
+        &psbt_signed
+            .clone()
+            .extract_tx()
+            .map_err(|e| BitcoinError::BitcoinPsbtExtractError(e.to_string()))?,
+    )
+    .to_hex();
+    let tx = Tx::from_str(tx_hex).map_err(|_| BitcoinError::WrongPsbt)?;
+
+    let esplora_url = BITCOIN_EXPLORER_API.read().await.to_string();
+    let esplora_client = esplora::Builder::new(&esplora_url)
+        .build_async()
+        .map_err(|e| BitcoinError::BuildEsploraError(e.to_string()))?;
+
+    debug!(format!("tx for broadcast: {tx_hex}"));
+    esplora_client
+        .broadcast(&tx)
+        .await
+        .map_err(|op| BitcoinError::BitcoinPsbtError(BitcoinPsbtError::Esplora(op)))?;
+
+    Ok(PublishedPsbtResponse {
+        sign: true,
+        txid: tx.txid().to_string(),
+    })
+}
+
 pub async fn drain_wallet(
     destination: &str,
     descriptor: &SecretString,
     change_descriptor: Option<&SecretString>,
     fee_rate: Option<f32>,
 ) -> Result<TransactionData, BitcoinError> {
-    let address = Address::from_str(destination)?;
-    validate_address(&address).await?;
+    let address = parse_checked_address(destination).await?;
     debug!(format!("Create drain wallet tx to: {address:#?}"));
 
     let wallet = get_wallet(descriptor, change_descriptor).await?;
     sync_wallet(&wallet).await?;
 
-    let fee_rate = fee_rate.map(FeeRate::from_sat_per_vb);
+    let fee_rate = fee_rate.map(fee_rate_from_sat_vb);
 
-    let (mut psbt, details) = {
-        let locked_wallet = wallet.lock().await;
+    let mut psbt = {
+        let mut locked_wallet = wallet.lock().await;
         let mut builder = locked_wallet.build_tx();
         if let Some(fee_rate) = fee_rate {
             builder.fee_rate(fee_rate);
         }
         builder.drain_wallet();
         builder.drain_to(address.script_pubkey());
-        builder.finish()?
+        builder
+            .finish()
+            .map_err(|e| BitcoinError::BdkCreateTxError(e.to_string()))?
     };
 
     debug!("Signing PSBT...");
     let finalized = wallet
         .lock()
         .await
-        .sign(&mut psbt, SignOptions::default())?;
+        .sign(&mut psbt, SignOptions::default())
+        .map_err(|e| BitcoinError::BdkSignError(e.to_string()))?;
 
     if !finalized {
         return Err(BitcoinError::DrainWalletUnfinalizedPsbt);
     }
     debug!(format!("Finalized: {finalized}"));
 
-    let blockchain = get_blockchain().await;
-    let tx = psbt.extract_tx();
+    let fee_sats = psbt
+        .fee()
+        .map(|a| a.to_sat())
+        .map_err(|_| BitcoinError::NoFeePresent)?;
+    let blockchain = get_blockchain().await?;
+    let tx = psbt
+        .extract_tx()
+        .map_err(|e| BitcoinError::BitcoinPsbtExtractError(e.to_string()))?;
+    let txid = tx.compute_txid();
     blockchain.broadcast(&tx).await?;
-    let tx = blockchain.get_tx(&details.txid).await?;
+    let fetched = blockchain.get_tx(&txid).await?;
 
-    if let Some(transaction) = tx.clone() {
+    if let Some(transaction) = fetched.clone() {
         let sent = transaction
             .output
             .iter()
-            .fold(0, |sum, output| output.value + sum);
+            .fold(0, |sum, output| output.value.to_sat() + sum);
 
         let details = TransactionDetails {
-            transaction: tx,
-            txid: transaction.txid(),
+            transaction: fetched,
+            txid: transaction.compute_txid(),
             received: 0,
             sent,
-            fee: details.fee,
+            fee: Some(fee_sats),
             confirmation_time: None,
         };
 
@@ -620,7 +777,8 @@ pub async fn drain_wallet(
             Some(tx_details) => tx_details.vsize(),
             None => 1,
         };
-        let fee_rate = details.fee.expect("fee is present on tx") as f32 / vsize as f32;
+
+        let fee_rate = fee_sats as f32 / vsize as f32;
 
         Ok(TransactionData {
             details,
@@ -647,27 +805,38 @@ pub async fn bump_fee(
         sync_wallet(&wallet).await?;
     }
 
-    let (mut psbt, details) = {
-        let wallet_lock = wallet.lock().await;
-        let mut builder = wallet_lock.build_fee_bump(txid)?;
-        builder.fee_rate(FeeRate::from_sat_per_vb(fee_rate));
-        builder.finish()?
+    let mut psbt = {
+        let mut wallet_lock = wallet.lock().await;
+        let mut builder = wallet_lock
+            .build_fee_bump(txid)
+            .map_err(|e| BitcoinError::BdkFeeBumpError(e.to_string()))?;
+        builder.fee_rate(fee_rate_from_sat_vb(fee_rate));
+        builder
+            .finish()
+            .map_err(|e| BitcoinError::BdkCreateTxError(e.to_string()))?
     };
 
     let _finalized = wallet
         .lock()
         .await
-        .sign(&mut psbt, SignOptions::default())?;
-    let tx = psbt.extract_tx();
+        .sign(&mut psbt, SignOptions::default())
+        .map_err(|e| BitcoinError::BdkSignError(e.to_string()))?;
+    let fee_sats = psbt.fee().ok().map(|a| a.to_sat());
+    let tx = psbt
+        .extract_tx()
+        .map_err(|e| BitcoinError::BitcoinPsbtExtractError(e.to_string()))?;
 
     if broadcast {
-        let blockchain = get_blockchain().await;
+        let blockchain = get_blockchain().await?;
         blockchain.broadcast(&tx).await?;
     }
 
-    let sent = tx.output.iter().fold(0, |sum, output| output.value + sum);
+    let sent = tx
+        .output
+        .iter()
+        .fold(0, |sum, output| output.value.to_sat() + sum);
 
-    let txid = tx.txid();
+    let txid = tx.compute_txid();
     let vsize = tx.vsize();
 
     let details = TransactionDetails {
@@ -675,7 +844,7 @@ pub async fn bump_fee(
         transaction: Some(tx),
         received: 0,
         sent,
-        fee: details.fee,
+        fee: fee_sats,
         confirmation_time: None,
     };
 

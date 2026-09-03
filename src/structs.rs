@@ -1,26 +1,47 @@
-#![allow(deprecated)]
-use bp::Outpoint;
 use garde::Validate;
-use psbt::Psbt;
-use rgb::MiningStatus;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-pub use bdk::{Balance, BlockTime, TransactionDetails};
-pub use bitcoin::{util::address::Address, Txid};
-use rgbstd::interface::rgb21::Allocation as AllocationUDA;
-
+use crate::rgb::models::{AssetKit, ContractKit, UtxoKit};
 use crate::{
-    rgb::{
-        structs::MediaMetadata,
-        swap::{PublicRgbBid, RgbAuctionStrategy, RgbBid, RgbOffer, RgbOfferSwap, RgbSwapStrategy},
-    },
-    validators::{
-        verify_descriptor, verify_media_request, verify_rgb_invoice, verify_tapret_seal,
-        verify_terminal_path, RGBContext,
-    },
+    rgb::models::ContractAmount,
+    rgb::swap::RgbSwap,
+    validators::{RGBValidationOptions, decimal_repr, rgb_select_option},
 };
+use bitcoin::{Address, Transaction, Txid, address::NetworkUnchecked};
+
+/// Wallet balances in satoshis. Same camelCase JSON as BDK 0.28 `Balance`
+/// (u64 fields). Do not serialize `bdk_wallet::Balance` (`Amount`) here.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct Balance {
+    pub immature: u64,
+    pub trusted_pending: u64,
+    pub untrusted_pending: u64,
+    pub confirmed: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockTime {
+    pub height: u32,
+    pub timestamp: u64,
+}
+
+/// Product transaction details. Same camelCase JSON as BDK 0.28
+/// `TransactionDetails` (u64 sent/received/fee).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TransactionDetails {
+    pub transaction: Option<Transaction>,
+    pub txid: Txid,
+    pub received: u64,
+    pub sent: u64,
+    pub fee: Option<u64>,
+    pub confirmation_time: Option<BlockTime>,
+}
+use rgb::invoice::{InvoiceState, NonFungible, RgbInvoice};
+use rgbstd::containers::Transfer;
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -52,7 +73,9 @@ pub struct TransactionData {
     pub fee_rate: f32,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, Zeroize, ZeroizeOnDrop, Display, Default)]
+#[derive(
+    Serialize, Deserialize, Clone, Debug, Zeroize, ZeroizeOnDrop, Display, Eq, PartialEq, Default,
+)]
 #[display(inner)]
 pub struct SecretString(pub String);
 
@@ -62,8 +85,7 @@ pub struct PrivateWalletData {
     pub xprvkh: String,
     pub btc_descriptor_xprv: String,
     pub btc_change_descriptor_xprv: String,
-    pub rgb_assets_descriptor_xprv: String,
-    pub rgb_udas_descriptor_xprv: String,
+    pub rgb_descriptor_xprv: String,
     pub nostr_prv: String,
     pub nostr_nsec: String,
 }
@@ -71,13 +93,10 @@ pub struct PrivateWalletData {
 #[derive(Serialize, Deserialize, Clone, Debug, Zeroize, ZeroizeOnDrop)]
 #[serde(rename_all = "camelCase")]
 pub struct PublicWalletData {
-    pub xpub: String,
     pub xpubkh: String,
-    pub watcher_xpub: String,
     pub btc_descriptor_xpub: String,
     pub btc_change_descriptor_xpub: String,
-    pub rgb_assets_descriptor_xpub: String,
-    pub rgb_udas_descriptor_xpub: String,
+    pub rgb_descriptor_xpub: String,
     pub nostr_pub: String,
     pub nostr_npub: String,
 }
@@ -109,58 +128,43 @@ pub struct EncryptedWalletDataV04 {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct FundVaultDetails {
-    pub assets_output: Option<String>,
-    pub udas_output: Option<String>,
+    pub rgb_output: Option<String>,
     pub is_funded: bool,
     pub fund_txid: Option<String>,
+    pub fund_fee: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoverVaultDetails {
+    pub txid: Option<String>,
+    pub fee: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct IssueAssetRequest {
-    pub sk: String,
-    pub request: IssueRequest,
+pub struct SatsInvoice {
+    pub amount: u64,
+    /// Unchecked so JSON round-trips (`Address<NetworkChecked>` has no Deserialize).
+    pub address: Address<NetworkUnchecked>,
+}
+
+pub struct ContainerResponse<T> {
+    pub data: T,
+    pub container: Option<RgbContainer>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
-#[derive(Validate)]
-#[garde(context(RGBContext))]
-pub struct FullIssueRequest {
-    /// The ticker of the asset
-    #[garde(ascii)]
-    #[garde(length(min = 1, max = 8))]
-    pub ticker: String,
-    /// Name of the asset
-    #[garde(ascii)]
-    #[garde(length(min = 1, max = 40))]
-    pub name: String,
-    /// Description of the asset
-    #[garde(ascii)]
-    #[garde(length(min = u8::MIN.into(), max = u8::MAX.into()))]
-    pub description: String,
-    /// Amount of the asset
-    #[garde(range(min = u64::MIN, max = u64::MAX))]
-    pub supply: u64,
-    /// Precision of the asset
-    #[garde(range(min = u8::MIN, max = u8::MAX))]
-    pub precision: u8,
-    /// Seal of the initial owner
-    #[garde(ascii)]
-    #[garde(custom(verify_tapret_seal))]
-    pub seal: String,
-    /// The name of the iface (ex: RGB20)
-    #[garde(alphanumeric)]
-    pub iface: String,
-    /// contract metadata (only RGB21/UDA)
-    #[garde(skip)]
-    pub meta: Option<MediaRequest>,
+pub struct RgbContainer {
+    pub rgb_stock: Option<String>,
+    pub rgb_account: Option<String>,
+    pub rgb_transfers: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, Validate)]
+#[garde(context(RGBValidationOptions))]
 #[serde(rename_all = "camelCase")]
-#[derive(Validate)]
-#[garde(context(RGBContext))]
 pub struct IssueRequest {
     /// The ticker of the asset
     #[garde(ascii)]
@@ -170,205 +174,79 @@ pub struct IssueRequest {
     #[garde(ascii)]
     #[garde(length(min = 1, max = 40))]
     pub name: String,
+    /// Iface (ex: RGB20)
+    #[garde(alphanumeric)]
+    pub iface: String,
     /// Description of the asset
     #[garde(ascii)]
     #[garde(length(min = u8::MIN.into(), max = u8::MAX.into()))]
     pub description: String,
     /// Amount of the asset
-    #[garde(range(min = u64::MIN, max = u64::MAX))]
-    pub supply: u64,
+    #[garde(ascii)]
+    pub supply: String,
     /// Precision of the asset
     #[garde(range(min = u8::MIN, max = u8::MAX))]
     pub precision: u8,
     /// Seal of the initial owner
     #[garde(ascii)]
-    #[garde(custom(verify_tapret_seal))]
     pub seal: String,
-    /// The name of the iface (ex: RGB20)
+    /// Chain Target
+    #[garde(skip)]
+    pub chain: ChainTarget,
+    /// contract metadata (only RGB21/UDA)
+    #[garde(dive)]
+    pub meta: Option<IssueMedia>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, Validate)]
+#[garde(context(RGBValidationOptions))]
+#[serde(rename_all = "camelCase")]
+pub struct AtomicMintRequest {
+    /// The ticker of the asset
+    #[garde(ascii)]
+    #[garde(length(min = 1, max = 8))]
+    pub ticker: String,
+    /// Name of the asset
+    #[garde(ascii)]
+    #[garde(length(min = 1, max = 40))]
+    pub name: String,
+    /// Iface (ex: RGB20)
     #[garde(alphanumeric)]
     pub iface: String,
-    /// contract metadata (only RGB21/UDA)
-    #[garde(custom(verify_media_request))]
-    pub meta: Option<IssueMediaRequest>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-#[derive(Validate)]
-#[garde(context(RGBContext))]
-pub struct SelfIssueRequest {
-    /// The ticker of the asset
-    #[garde(ascii)]
-    #[garde(length(min = 1, max = 8))]
-    pub ticker: String,
-    /// Name of the asset
-    #[garde(ascii)]
-    #[garde(length(min = 1, max = 40))]
-    pub name: String,
     /// Description of the asset
     #[garde(ascii)]
     #[garde(length(min = u8::MIN.into(), max = u8::MAX.into()))]
     pub description: String,
-    /// contract metadata (only RGB21/UDA)
-    #[garde(custom(verify_media_request))]
-    pub meta: Option<IssueMediaRequest>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-#[serde(rename_all = "camelCase")]
-#[derive(Validate)]
-#[garde(context(RGBContext))]
-pub struct ReIssueRequest {
-    /// previous contracts
+    /// Chain Target
     #[garde(skip)]
-    pub contracts: Vec<ContractResponse>,
+    pub chain: ChainTarget,
+    /// contract metadata (only RGB21/UDA)
+    #[garde(dive)]
+    pub meta: Option<IssueMedia>,
+    /// Bitcoin Price
+    #[garde(range(min = 0, max = u64::MAX))]
+    pub bitcoin_price: u64,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, Validate)]
+#[garde(context(RGBValidationOptions))]
 #[serde(rename_all = "camelCase")]
-pub struct IssueMediaRequest {
-    pub preview: Option<MediaInfo>,
-    pub media: Option<MediaInfo>,
-    pub attachments: Vec<MediaInfo>,
+pub struct LoadWalletsRequest {
+    /// Number of wallets to request
+    #[garde(range(min = u16::MIN, max = u16::MAX))]
+    pub number_of_wallets: u16,
+    /// Chain Target
+    #[garde(skip)]
+    pub chain: ChainTarget,
 }
 
-impl From<ContractMediaDetail> for IssueMediaRequest {
-    fn from(value: ContractMediaDetail) -> Self {
-        Self {
-            preview: value.preview,
-            media: value.media,
-            attachments: value.attachments,
-        }
-    }
-}
-
-impl From<MediaResponse> for IssueMediaRequest {
-    fn from(value: MediaResponse) -> Self {
-        let preview = value.preview.map(MediaInfo::from);
-        let media = value.media.map(MediaInfo::from);
-        let attachments = value.attachments.into_iter().map(MediaInfo::from).collect();
-
-        Self {
-            preview,
-            media,
-            attachments,
-        }
-    }
-}
-
-#[deprecated(
-    since = "0.7.0-beta.4",
-    note = "please use `IssueMediaRequest` instead"
-)]
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct IssueMetaRequest(pub IssueMetadata);
-
-impl IssueMetaRequest {
-    pub fn with(metadata: IssueMetadata) -> Self {
-        IssueMetaRequest(metadata)
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-pub enum IssueMetadata {
-    #[serde(rename = "uda")]
-    UDA(Vec<MediaInfo>),
-
-    #[serde(rename = "collectible")]
-    Collectible(Vec<NewCollectible>),
-}
-
-impl Default for IssueMetadata {
-    fn default() -> Self {
-        IssueMetadata::UDA(vec![])
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-#[serde(rename_all = "camelCase")]
-#[derive(Validate)]
-#[garde(context(RGBContext))]
-pub struct NewCollectible {
-    /// The ticker of the asset
-    #[garde(ascii)]
-    #[garde(length(min = 1, max = 8))]
-    pub ticker: String,
-    /// Name of the asset
-    #[garde(ascii)]
-    #[garde(length(min = 1, max = 40))]
-    pub name: String,
-    /// Description of the asset
-    #[garde(ascii)]
-    #[garde(length(min = u8::MIN.into(), max = u8::MAX.into()))]
-    pub description: String,
-    /// attachments and media
-    #[garde(length(min = u8::MIN.into(), max = u8::MAX.into()))]
-    pub media: Vec<MediaInfo>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-#[serde(rename_all = "camelCase")]
-#[derive(Validate)]
-#[garde(context(RGBContext))]
-pub struct MediaInfo {
-    /// Media Ty
-    #[serde(rename = "type")]
-    #[garde(ascii)]
-    #[garde(length(min = 1, max = 64))]
-    pub ty: String,
-    /// Media Digest
-    #[garde(ascii)]
-    #[garde(length(min = u16::MIN.into(), max = u16::MAX.into()))]
-    pub source: String,
-}
-
-impl From<MediaView> for MediaInfo {
-    fn from(value: MediaView) -> Self {
-        Self {
-            ty: value.ty,
-            source: value.source,
-        }
-    }
-}
-
-impl From<MediaMetadata> for MediaInfo {
-    fn from(value: MediaMetadata) -> Self {
-        Self {
-            ty: value.mime,
-            source: value.uri,
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-#[serde(rename_all = "camelCase")]
-#[derive(Validate)]
-#[garde(context(RGBContext))]
-pub struct AttachInfo {
-    /// Mime Type of the media
-    #[serde(rename = "type")]
-    #[garde(ascii)]
-    #[garde(length(min = 1, max = 64))]
-    pub ty: String,
-    /// URI or Hash of the Attachment
-    #[garde(ascii)]
-    #[garde(length(min = u16::MIN.into(), max = u16::MAX.into()))]
-    pub source: String,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, PartialEq, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct IssueResponse {
     /// The contract id
     pub contract_id: String,
-    /// The contract impl id
-    pub iimpl_id: String,
     /// The contract interface
     pub iface: String,
-    /// The Issue Close Method
-    pub issue_method: String,
     /// The Issue Utxo
     pub issue_utxo: String,
     /// The ticker of the asset
@@ -383,20 +261,63 @@ pub struct IssueResponse {
     pub supply: u64,
     /// Precision of the asset
     pub precision: u8,
+    /// Amount of the asset
+    pub balance: ContractValue,
     /// The contract state (multiple formats)
-    pub contract: ContractFormats,
-    /// The gensis state (multiple formats)
-    pub genesis: GenesisFormats,
+    pub contract: String,
+    /// The contract allocations
+    pub allocations: Vec<ContractAllocation>,
     /// contract metadata (only RGB21/UDA)
-    pub meta: Option<ContractMediaDetail>,
+    pub meta: Option<UDAItem>,
+}
+
+impl IssueResponse {
+    pub fn to_normalize_balance(&self) -> f64 {
+        let resp = match &self.balance {
+            ContractValue::Value(amount) => ContractAmount::with(*amount, self.precision)
+                .to_string()
+                .parse(),
+            ContractValue::UDA(allocation) => {
+                ContractAmount::with(allocation.fraction, self.precision)
+                    .to_string()
+                    .parse()
+            }
+        };
+
+        resp.unwrap_or(0.0)
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AtomicMintResponse {
+    /// IssueResponse
+    pub issue_response: IssueResponse,
+    /// SwapOfferResponse
+    pub rgb_offer_response: Vec<RgbOfferResponse>,
+}
+
+pub type ContractResponse = IssueResponse;
+
+#[derive(Serialize, Deserialize, PartialEq, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct UDAItem {
+    // Token Index
+    pub token_index: u32,
+    /// media of the uda
+    pub media: IssueMedia,
+}
+
+impl UDAItem {
+    pub fn with(token_index: u32, media: IssueMedia) -> Self {
+        Self { token_index, media }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ContractFormats {
-    /// The contract state (encoded in bech32m)
-    pub legacy: String,
-    /// The contract state (encoded in strict)
+    /// The contract state (encoded in hexadecimal)
     pub strict: String,
     /// The contract state (compiled in armored mode)
     pub armored: String,
@@ -405,191 +326,259 @@ pub struct ContractFormats {
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct GenesisFormats {
-    /// The genesis state (encoded in bech32m)
-    pub legacy: String,
-    /// The genesis state (encoded in strict)
+    /// The genesis state (encoded in hexadecimal)
     pub strict: String,
-    /// The contract state (compiled in armored mode)
-    pub armored: String,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Debug, Default, Validate)]
+#[garde(context(RGBValidationOptions))]
 #[serde(rename_all = "camelCase")]
-pub struct ReIssueResponse {
-    pub contracts: Vec<IssueResponse>,
+pub struct IssueMedia {
+    #[garde(dive)]
+    pub preview: Option<MediaData>,
+    #[garde(dive)]
+    pub media: Option<MediaData>,
+    #[garde(dive)]
+    pub attachments: Vec<MediaData>,
 }
 
-#[derive(Eq, PartialEq, Serialize, Deserialize, Debug, Clone)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Debug, Default, Validate)]
+#[garde(context(RGBValidationOptions))]
 #[serde(rename_all = "camelCase")]
-pub enum AssetType {
-    #[serde(rename = "bitcoin")]
-    Bitcoin = 0,
-    #[serde(rename = "change")]
-    Change = 1,
-    #[serde(rename = "contract")]
-    Contract = 10,
-    #[serde(rename = "rgb20")]
-    RGB20 = 20,
-    #[serde(rename = "rgb21")]
-    RGB21 = 21,
-}
-
-impl std::fmt::Display for AssetType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-#[derive(Validate)]
-#[garde(context(RGBContext))]
-pub struct ImportRequest {
-    /// The type data
-    #[garde(skip)]
-    pub import: AssetType,
-    /// The payload data (in hexadecimal)
+pub struct MediaData {
+    /// Media Ty
     #[garde(ascii)]
-    #[garde(length(min = 0, max = usize::MAX))]
-    pub data: String,
+    #[garde(length(min = 1, max = 64))]
+    #[serde(rename = "type")]
+    pub ty: String,
+    /// Media Uri/Source
+    #[garde(ascii)]
+    #[garde(length(min = u16::MIN.into(), max = u16::MAX.into()))]
+    pub uri: String,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
-pub struct ContractHiddenResponse {
-    /// The contract id
-    pub contract_id: String,
-    /// is hidden
-    pub hidden: bool,
+pub struct ContractAllocation {
+    /// Anchored UTXO
+    pub utxo: String,
+    /// Asset Value
+    pub value: ContractValue,
+    /// Derivation Path
+    pub derivation: String,
+    /// My Allocation?
+    pub is_mine: bool,
+    /// Allocation spent?
+    pub is_spent: bool,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, Debug, Clone, Display)]
 #[serde(rename_all = "camelCase")]
-pub struct ContractResponse {
-    /// The contract id
-    pub contract_id: String,
-    /// The contract impl id
-    pub iimpl_id: String,
-    /// The contract interface
-    pub iface: String,
-    /// The ticker of the asset
-    pub ticker: String,
-    /// Name of the asset
-    pub name: String,
-    /// creation date (timestamp)
-    pub created: i64,
-    /// Description of the asset
-    pub description: String,
-    /// Supply of the asset
-    pub supply: u64,
-    /// Precision of the asset
-    pub precision: u8,
-    /// Current balance
-    pub balance: u64,
-    /// Current balance (Humanized)
-    pub balance_normalized: f64,
-    /// The contract allocations
-    pub allocations: Vec<AllocationDetail>,
-    /// The contract state (multiple formats)
-    pub contract: ContractFormats,
-    /// The genesis state (multiple formats)
-    pub genesis: GenesisFormats,
-    /// contract metadata (only RGB21/UDA)
-    pub meta: Option<ContractMediaDetail>,
-}
-
-#[deprecated(
-    since = "0.7.0-beta.4",
-    note = "please use `ContractMediaDetail` instead"
-)]
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct ContractMeta(ContractMetadata);
-
-impl ContractMeta {
-    pub fn with(metadata: ContractMetadata) -> Self {
-        ContractMeta(metadata)
-    }
-
-    pub fn meta(self) -> ContractMetadata {
-        self.0
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-pub enum ContractMetadata {
+pub enum ContractValue {
+    #[display(inner)]
+    #[serde(rename = "value")]
+    Value(u64),
+    #[display(inner)]
     #[serde(rename = "uda")]
-    UDA(UDADetail),
-
-    #[serde(rename = "collectible")]
-    Collectible(Vec<UDADetail>),
+    UDA(UDAValue),
 }
 
-impl Default for ContractMetadata {
+impl Default for ContractValue {
     fn default() -> Self {
-        ContractMetadata::UDA(UDADetail::default())
+        ContractValue::Value(0)
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(
+    Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, Debug, Clone, Display, Validate,
+)]
+#[garde(context(RGBValidationOptions))]
 #[serde(rename_all = "camelCase")]
-pub struct ContractMediaDetail {
-    /// the token index of the uda
+#[display("{token_index}@{fraction}")]
+pub struct UDAValue {
+    #[garde(range(min = 1, max = u32::MAX))]
     pub token_index: u32,
-    /// The ticker of the uda
-    pub ticker: String,
-    /// Name of the uda
-    pub name: String,
-    /// Description of the uda
-    pub description: String,
-    /// The user contract balance
-    pub balance: u64,
-    /// Preview of the uda
-    pub preview: Option<MediaInfo>,
-    /// Media of the uda
-    pub media: Option<MediaInfo>,
-    /// Attachments of the uda
-    pub attachments: Vec<MediaInfo>,
-    /// The contract allocations
-    pub allocations: Vec<AllocationDetail>,
+    #[garde(range(min = 1, max = u64::MAX))]
+    pub fraction: u64,
+}
+
+impl Default for UDAValue {
+    fn default() -> Self {
+        Self {
+            token_index: 1,
+            fraction: 1,
+        }
+    }
+}
+
+impl UDAValue {
+    pub fn with(token_index: u32, fraction: u64) -> Self {
+        Self {
+            token_index,
+            fraction,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Validate)]
+#[garde(context(RGBValidationOptions))]
+#[serde(rename_all = "camelCase")]
+pub struct RgbInvoiceRequest {
+    /// The contract id
+    #[garde(ascii)]
+    #[garde(length(min = 0, max = 100))]
+    pub contract_id: Option<String>,
+    /// Amount of the asset
+    #[garde(dive)]
+    pub amount: RgbInvoiceValue,
+    /// Blinded UTXO
+    #[garde(custom(rgb_select_option))]
+    pub seal: RgbSelection,
+    /// Expiration
+    #[garde(range(min = i64::MIN, max = i64::MAX))]
+    pub expire_at: Option<i64>,
+}
+
+#[derive(
+    Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, Debug, Clone, Display, Validate,
+)]
+#[garde(context(RGBValidationOptions))]
+#[serde(rename_all = "camelCase")]
+#[display("{0:?}")]
+pub enum RgbSelection {
+    /// Chain/Next UTXO
+    #[serde(rename = "next_utxo")]
+    NextUTXO,
+    #[serde(rename = "next_address")]
+    NextAddress,
+    #[serde(rename = "utxo")]
+    UTXO(#[garde(skip)] String),
+    /// Chain/Next Address
+    #[serde(rename = "address")]
+    Address(#[garde(skip)] String),
+}
+
+impl RgbSelection {
+    pub fn is_address(&self) -> bool {
+        matches!(self, Self::Address(_)) || matches!(self, Self::NextAddress)
+    }
+
+    pub fn is_utxo(&self) -> bool {
+        matches!(self, Self::UTXO(_)) || matches!(self, Self::NextUTXO)
+    }
+}
+
+#[derive(
+    Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, Debug, Clone, Display, Validate,
+)]
+#[garde(context(RGBValidationOptions))]
+#[serde(rename_all = "camelCase")]
+pub enum RgbInvoiceValue {
+    #[display(inner)]
+    #[serde(rename = "value")]
+    Value(#[garde(custom(decimal_repr))] String),
+    #[serde(rename = "uda")]
+    UDA(#[garde(dive)] UDAValue),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
-pub struct UDADetail {
-    /// the token index of the uda
-    pub token_index: u32,
-    /// The ticker of the uda
-    pub ticker: String,
-    /// Name of the uda
-    pub name: String,
-    /// Description of the uda
-    pub description: String,
-    /// The user contract balance
-    pub balance: u64,
-    /// Media of the uda
-    pub media: Vec<MediaInfo>,
-    /// Attach of the uda
-    pub attach: Option<AttachInfo>,
-    /// The contract allocations
-    pub allocations: Vec<AllocationDetail>,
-}
-
-#[derive(Clone, PartialEq, Eq, Hash, Debug, Display, Serialize, Deserialize)]
-#[display("{contract_id}:{iface_id}:{precision}")]
-pub struct SimpleContractResponse {
-    pub contract_id: String,
-    pub iface_id: String,
-    pub precision: u8,
+pub struct RgbInvoiceResponse {
+    /// Invoice encoded in Baid58
+    pub invoice: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
-#[derive(Validate)]
-#[garde(context(RGBContext))]
-pub struct InvoiceRequest {
-    /// The contract id
+pub struct RgbInvoiceDecoded {
+    /// ContractID
+    pub contract_id: String,
+    /// Invoice Amount
+    pub amount: RgbInvoiceValue,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RgbInvoiceStatusResponse {
+    /// Asset Name
+    pub asset_name: String,
+    /// Asset Name
+    pub asset_ticker: String,
+    /// ContractID
+    pub contract_id: String,
+    /// Invoice Amount
+    pub amount: RgbInvoiceValue,
+    /// Invoice Status
+    pub status: RgbInvoiceStatus,
+    /// Invoice Encoded
+    pub invoice: String,
+}
+
+impl RgbInvoiceStatusResponse {
+    pub fn new(
+        invoice: &RgbInvoice,
+        status: &bool,
+        asset_name: &str,
+        asset_ticker: &str,
+        asset_precision: &u8,
+    ) -> Self {
+        let RgbInvoice {
+            contract,
+            assignment_state,
+            ..
+        } = invoice.clone();
+
+        let contract_id = contract.map_or(String::new(), |x| x.to_string());
+        let status = if *status {
+            RgbInvoiceStatus::Payed
+        } else {
+            RgbInvoiceStatus::Opened
+        };
+
+        let amount = match assignment_state {
+            Some(InvoiceState::Amount(amount)) => RgbInvoiceValue::Value(
+                ContractAmount::with(amount.value(), *asset_precision).to_string(),
+            ),
+            Some(InvoiceState::Data(NonFungible::FractionedToken(allocation))) => {
+                RgbInvoiceValue::UDA(UDAValue::with(
+                    allocation.token_index().into(),
+                    allocation.fraction().into(),
+                ))
+            }
+            _ => RgbInvoiceValue::Value("0".to_string()),
+        };
+
+        Self {
+            contract_id,
+            amount,
+            status,
+            invoice: invoice.to_string(),
+            asset_ticker: asset_ticker.to_string(),
+            asset_name: asset_name.to_string(),
+        }
+    }
+
+    pub fn unknown(invoice: &RgbInvoice, status: &bool) -> Self {
+        RgbInvoiceStatusResponse::new(invoice, status, default!(), default!(), &u8::MIN)
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, Display)]
+#[serde(rename_all = "camelCase")]
+pub enum RgbInvoiceStatus {
+    #[default]
+    #[display("opened")]
+    Opened,
+    #[display("payed")]
+    Payed,
+    #[display("canceled")]
+    Canceled,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Validate)]
+#[garde(context(RGBValidationOptions))]
+#[serde(rename_all = "camelCase")]
+pub struct RgbTransferRequest {
     #[garde(ascii)]
     #[garde(length(min = 0, max = 100))]
     pub contract_id: String,
@@ -597,141 +586,263 @@ pub struct InvoiceRequest {
     #[garde(ascii)]
     #[garde(length(min = 0, max = 32))]
     pub iface: String,
-    /// Amount of the asset
-    #[garde(skip)]
-    pub amount: String,
-    /// Blinded UTXO
+    /// RGB Invoice
     #[garde(ascii)]
-    #[garde(custom(verify_tapret_seal))]
-    pub seal: String,
-    /// Query parameters
-    #[garde(skip)]
-    pub params: HashMap<String, String>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-#[derive(Validate)]
-#[garde(context(RGBContext))]
-pub struct SelfInvoiceRequest {
-    /// The contract id
-    #[garde(ascii)]
-    #[garde(length(min = 0, max = 100))]
-    pub contract_id: String,
-    /// Query parameters
-    #[garde(skip)]
-    pub params: HashMap<String, String>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct InvoiceResponse {
-    /// Invoice encoded in Baid58
+    #[garde(length(min = 0, max = 512))]
     pub invoice: String,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-#[serde(rename_all = "camelCase")]
-#[derive(Validate)]
-#[garde(context(RGBContext))]
-pub struct PsbtRequest {
-    /// Asset UTXOs
+    /// Optional amount provided by the sender for blinded invoices (ignored if invoice carries amount/allocation)
     #[garde(dive)]
-    #[garde(length(min = 0, max = 999))]
-    pub asset_inputs: Vec<PsbtInputRequest>,
-    /// Asset Descriptor Change
+    pub sender_amount: Option<RgbInvoiceValue>,
+    /// Chain Target
     #[garde(skip)]
-    pub asset_descriptor_change: Option<SecretString>,
-    /// Asset Terminal Change (default: /10/0)
-    #[garde(skip)]
-    pub asset_terminal_change: Option<String>,
-    /// Bitcoin UTXOs
+    pub chain: ChainTarget,
+    /// Chain Fee
     #[garde(dive)]
-    #[garde(length(min = 0, max = 999))]
-    pub bitcoin_inputs: Vec<PsbtInputRequest>,
-    /// Bitcoin Change Addresses (format: {address}:{amount})
-    #[garde(length(min = 0, max = 999))]
-    pub bitcoin_changes: Vec<String>,
-    /// Bitcoin Fee
-    #[garde(dive)]
-    pub fee: PsbtFeeRequest,
-    /// Allow RBF
-    #[garde(skip)]
-    pub rbf: bool,
+    pub chain_fee: ChainFee,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Validate, Display)]
+#[garde(context(RGBValidationOptions))]
 #[serde(rename_all = "camelCase")]
-#[derive(Validate)]
-#[garde(context(RGBContext))]
-pub struct PsbtInputRequest {
-    /// Asset or Bitcoin Descriptor
-    #[garde(custom(verify_descriptor))]
-    pub descriptor: SecretString,
-    /// Asset or Bitcoin UTXO
-    #[garde(ascii)]
-    pub utxo: String,
-    /// Asset or Bitcoin UTXO Terminal (ex. /0/0)
-    #[garde(custom(verify_terminal_path))]
-    pub utxo_terminal: String,
-    /// Asset or Bitcoin Tweak
-    #[garde(skip)]
-    pub tapret: Option<String>,
-    /// Asset or Bitcoin Tweak
-    #[garde(skip)]
-    pub sigh_hash: Option<PsbtSigHashRequest>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-#[serde(rename_all = "camelCase")]
-pub enum PsbtSigHashRequest {
-    /// 0x1: Sign all outputs.
-    #[default]
-    All = 0x01,
-    /// 0x2: Sign no outputs --- anyone can choose the destination.
-    None = 0x02,
-    /// 0x3: Sign the output whose index matches this input's index. If none exists,
-    /// sign the hash `0000000000000000000000000000000000000000000000000000000000000001`.
-    /// (This rule is probably an unintentional C++ism, but it's consensus so we have
-    /// to follow it.)
-    Single = 0x03,
-    /// 0x81: Sign all outputs but only this input.
-    AllPlusAnyoneCanPay = 0x81,
-    /// 0x82: Sign no outputs and only this input.
-    NonePlusAnyoneCanPay = 0x82,
-    /// 0x83: Sign one output and only this input (see `Single` for what "one output" means).
-    SinglePlusAnyoneCanPay = 0x83,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-#[derive(Validate)]
-#[garde(context(RGBContext))]
-pub enum PsbtFeeRequest {
+pub enum ChainFee {
+    #[display("value")]
     Value(#[garde(range(min = 0, max = u64::MAX))] u64),
+    #[display("feeRate")]
     FeeRate(#[garde(skip)] f32),
+    #[display("none")]
+    None,
 }
 
-impl Default for PsbtFeeRequest {
+impl Default for ChainFee {
     fn default() -> Self {
         Self::Value(0)
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Clone, Serialize, Deserialize, Debug, Default)]
 #[serde(rename_all = "camelCase")]
-
-pub struct PsbtResponse {
-    /// PSBT encoded in Base64
+pub struct RgbTransferResponse {
+    /// Consignment ID (in base58)
+    pub consig_id: String,
+    /// Consignment (in armored)
+    pub consig: String,
+    /// Transfer Bitcoin L1 transaction id
+    pub txid: String,
+    /// PSBT File (in base64)
     pub psbt: String,
-    /// Asset UTXO Terminal (ex. /0/0)
-    pub terminal: String,
+    /// Tapret Commitment
+    pub commit: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Default, Display)]
+#[serde(rename_all = "camelCase")]
+pub enum ChainTarget {
+    #[default]
+    #[display("bitcoin")]
+    Bitcoin,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Validate)]
+#[serde(rename_all = "camelCase")]
+#[garde(context(RGBValidationOptions))]
+pub struct AcceptRequest {
+    /// Consignment encoded in hexadecimal
+    #[garde(ascii)]
+    #[garde(length(min = 0, max = usize::MAX))]
+    pub consignment: String,
+    /// Force Consignment accept
+    #[garde(skip)]
+    pub force: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AcceptResponse {
+    /// Transfer ID (Consig ID)
+    pub transfer_id: String,
+    /// Contract ID
+    pub contract_id: String,
+    /// Anchor Bitcoin transaction id
+    pub txid: String,
+    /// Transfer accept status
+    pub valid: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Validate)]
+#[serde(rename_all = "camelCase")]
+#[garde(context(RGBValidationOptions))]
+pub struct SaveTransferRequest {
+    /// Consignment encoded in hexadecimal
+    #[garde(ascii)]
+    #[garde(length(min = 0, max = usize::MAX))]
+    pub consignment: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RgbTransferItem {
+    pub contract_id: String,
+    pub iface: String,
+    pub direction: Direction,
+}
+
+impl RgbTransferItem {
+    pub fn incoming(contract_id: &str, iface: &str, transfer: TransferIn) -> Self {
+        Self {
+            contract_id: contract_id.to_string(),
+            iface: iface.to_string(),
+            direction: Direction::In(transfer),
+        }
+    }
+
+    pub fn outcoming(contract_id: &str, iface: &str, transfer: TransferOut) -> Self {
+        Self {
+            contract_id: contract_id.to_string(),
+            iface: iface.to_string(),
+            direction: Direction::Out(transfer),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
-#[derive(Validate)]
-#[garde(context(RGBContext))]
+pub enum Direction {
+    #[serde(rename = "in")]
+    In(TransferIn),
+    #[serde(rename = "out")]
+    Out(TransferOut),
+}
+
+impl Default for Direction {
+    fn default() -> Self {
+        Self::In(TransferIn::default())
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferIn {
+    pub invoice: String,
+    pub tx_id: String,
+    pub tx_status: TxStatus,
+    pub transfer: Option<TransferItem>,
+    pub amount: Option<ContractAmount>,
+    // RGB21 (UDA) display value (token_index/fraction) — optional alongside fungible amount
+    pub uda: Option<UDAValue>,
+}
+
+impl TransferIn {
+    pub fn with(
+        invoice: String,
+        tx_id: String,
+        tx_status: TxStatus,
+        transfer: Option<TransferItem>,
+        amount: Option<ContractAmount>,
+    ) -> Self {
+        Self {
+            invoice,
+            tx_id,
+            tx_status,
+            transfer,
+            amount,
+            uda: None,
+        }
+    }
+
+    pub fn unknown(invoice: String, tx_id: String, transfer: Option<TransferItem>) -> Self {
+        Self {
+            invoice,
+            tx_id,
+            transfer,
+            tx_status: TxStatus::NotFound,
+            amount: None,
+            uda: None,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferOut {
+    pub invoice: String,
+    pub tx_id: String,
+    pub tx_status: TxStatus,
+    pub transfer: TransferItem,
+    pub amount: Option<ContractAmount>,
+    // RGB21 (UDA) display value (token_index/fraction) — optional alongside fungible amount
+    pub uda: Option<UDAValue>,
+}
+
+impl TransferOut {
+    pub fn with(
+        invoice: String,
+        transfer: TransferItem,
+        tx_id: String,
+        tx_status: TxStatus,
+        amount: Option<ContractAmount>,
+    ) -> Self {
+        Self {
+            tx_id,
+            tx_status,
+            invoice,
+            transfer,
+            amount,
+            uda: None,
+        }
+    }
+
+    pub fn unknown(invoice: String, transfer: TransferItem, tx_id: String) -> Self {
+        Self {
+            invoice,
+            transfer,
+            tx_id,
+            tx_status: TxStatus::NotFound,
+            amount: None,
+            uda: None,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferItem {
+    pub transfer_id: String,
+    pub transfer: String,
+    pub is_accept: bool,
+}
+
+impl TransferItem {
+    pub fn with(transfer: &Transfer, is_accept: bool) -> Self {
+        Self {
+            transfer_id: transfer.consignment_id().to_string(),
+            transfer: transfer.to_string(),
+            is_accept,
+        }
+    }
+}
+
+#[derive(
+    Eq, Ord, PartialEq, PartialOrd, Hash, Serialize, Deserialize, Clone, Debug, Display, Default,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum TxStatus {
+    #[default]
+    #[display(inner)]
+    #[serde(rename = "not_found")]
+    NotFound,
+    #[serde(rename = "error")]
+    Error(String),
+    #[serde(rename = "mempool")]
+    Mempool,
+    #[serde(rename = "confirmed")]
+    Confirmed,
+    #[serde(rename = "block")]
+    Block { height: u32, timestamp: u64 },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Validate)]
+#[serde(rename_all = "camelCase")]
+#[garde(context(RGBValidationOptions))]
 pub struct SignPsbtRequest {
     /// PSBT encoded in Base64
     #[garde(length(min = 0, max = usize::MAX))]
@@ -751,10 +862,9 @@ pub struct SignedPsbtResponse {
     pub psbt: String,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Validate)]
 #[serde(rename_all = "camelCase")]
-#[derive(Validate)]
-#[garde(context(RGBContext))]
+#[garde(context(RGBValidationOptions))]
 pub struct PublishPsbtRequest {
     /// PSBT encoded in Base64
     #[garde(length(min = 0, max = usize::MAX))]
@@ -770,310 +880,9 @@ pub struct PublishedPsbtResponse {
     pub txid: String,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Validate, Serialize, Deserialize, Debug, Clone)]
+#[garde(context(RGBValidationOptions))]
 #[serde(rename_all = "camelCase")]
-#[derive(Validate)]
-#[garde(context(RGBContext))]
-pub struct RgbTransferRequest {
-    /// RGB Invoice
-    #[garde(ascii)]
-    #[garde(length(min = 0, max = 512))]
-    #[garde(custom(verify_rgb_invoice))]
-    pub rgb_invoice: String,
-    /// PSBT File Information
-    #[garde(ascii)]
-    #[garde(length(min = 0, max = usize::MAX))]
-    pub psbt: String,
-    /// Asset UTXO Terminal (ex. /0/0)
-    #[garde(custom(verify_terminal_path))]
-    pub terminal: String,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-#[derive(Validate)]
-#[garde(context(RGBContext))]
-pub struct FullRgbTransferRequest {
-    #[garde(ascii)]
-    #[garde(length(min = 0, max = 100))]
-    pub contract_id: String,
-    /// The contract interface
-    #[garde(ascii)]
-    #[garde(length(min = 0, max = 32))]
-    pub iface: String,
-    /// RGB Invoice
-    #[garde(ascii)]
-    #[garde(length(min = 0, max = 512))]
-    pub rgb_invoice: String,
-    /// Asset Descriptor
-    #[garde(custom(verify_descriptor))]
-    pub descriptor: SecretString,
-    /// Asset Terminal Change
-    #[garde(ascii)]
-    pub change_terminal: String,
-    /// Bitcoin Fee
-    #[garde(dive)]
-    pub fee: PsbtFeeRequest,
-    /// Bitcoin Change Addresses (format: {address}:{amount})
-    #[garde(length(min = 0, max = 999))]
-    pub bitcoin_changes: Vec<String>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-#[derive(Validate)]
-#[garde(context(RGBContext))]
-pub struct SelfFullRgbTransferRequest {
-    /// The contract id
-    #[garde(ascii)]
-    #[garde(length(min = 0, max = 100))]
-    pub contract_id: String,
-    /// The contract interface
-    #[garde(ascii)]
-    #[garde(length(min = 0, max = 32))]
-    pub iface: String,
-    /// RGB Invoice
-    #[garde(ascii)]
-    #[garde(length(min = 0, max = 512))]
-    pub rgb_invoice: String,
-    /// Bitcoin Change Terminal
-    #[garde(ascii)]
-    #[garde(length(min = 4, max = 4))]
-    pub terminal: String,
-    /// Bitcoin Change Addresses (format: {address}:{amount})
-    #[garde(length(min = 0, max = 999))]
-    pub bitcoin_changes: Vec<String>,
-    /// Bitcoin Fee
-    #[garde(skip)]
-    pub fee: Option<u64>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-#[serde(rename_all = "camelCase")]
-#[derive(Validate)]
-#[garde(context(RGBContext))]
-pub struct RgbInternalSaveTransferRequest {
-    /// The Consignment ID
-    #[garde(ascii)]
-    #[garde(length(min = 0, max = 100))]
-    pub consig_id: String,
-    /// The Face Symbol
-    #[garde(ascii)]
-    #[garde(length(min = 0, max = 100))]
-    pub iface: String,
-    /// Consignment Data (Hex)
-    #[garde(ascii)]
-    pub consig: String,
-    /// Beneficiary
-    #[garde(ascii)]
-    pub beneficiary: String,
-    /// Sender?
-    #[garde(skip)]
-    pub sender: bool,
-    /// UTXO realted with Transfer
-    #[garde(length(min = 0, max = 999))]
-    pub utxos: Vec<String>,
-    /// List of Beneficiaries(aka. invoices)
-    #[garde(skip)]
-    pub beneficiaries: Option<BTreeMap<String, String>>,
-    /// PSBT related with Transfer
-    #[garde(skip)]
-    pub psbt: Option<Psbt>,
-}
-
-impl RgbInternalSaveTransferRequest {
-    pub(crate) fn with(
-        consig_id: String,
-        consig: String,
-        beneficiary: String,
-        iface: String,
-        sender: bool,
-        beneficiaries: Option<BTreeMap<String, String>>,
-        psbt: Option<Psbt>,
-    ) -> Self {
-        let mut utxos = vec![];
-        if let Some(psbt) = psbt.clone() {
-            utxos = psbt
-                .inputs
-                .into_iter()
-                .map(|x| x.previous_outpoint.to_string())
-                .collect();
-        }
-
-        Self {
-            consig_id,
-            iface,
-            consig,
-            beneficiary,
-            sender,
-            utxos,
-            beneficiaries,
-            psbt,
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct RgbTransferResponse {
-    /// Consignment ID
-    pub consig_id: String,
-    /// Consignment encoded (in hexadecimal)
-    pub consig: String,
-    /// PSBT File Information with tapret (in hexadecimal)
-    pub psbt: String,
-    /// Tapret Commitment (used to spend output)
-    pub commit: String,
-    /// Transfer Bitcoin L1 transaction id
-    pub txid: String,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct RgbReplaceResponse {
-    /// Consignment ID
-    pub consig_id: String,
-    /// Consignment encoded (in hexadecimal)
-    pub consig: String,
-    /// PSBT File Information with tapret (in hexadecimal)
-    pub psbt: String,
-    /// Tapret Commitment (used to spend output)
-    pub commit: String,
-    /// Strict Consignments (in hexadecimal)
-    pub consigs: BTreeMap<String, String>,
-    /// Transfer Bitcoin L1 transaction id
-    pub txid: String,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct RgbInternalTransferResponse {
-    /// Consignment ID
-    pub consig_id: String,
-    /// Consignment encoded (in hexadecimal)
-    pub consig: String,
-    /// PSBT File Information with tapret (in hexadecimal)
-    pub psbt: String,
-    /// Outpoint (used to spend output)
-    pub outpoint: String,
-    /// Outpoint Amount (used to spend output)
-    pub amount: u64,
-    /// Tapret Commitment (used to spend output)
-    pub commit: String,
-    /// Strict Consignments (in hexadecimal)
-    pub consigs: BTreeMap<String, String>,
-    /// Transfer Bitcoin L1 transaction id
-    pub txid: String,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-#[derive(Validate)]
-#[garde(context(RGBContext))]
-pub struct AcceptRequest {
-    /// Consignment encoded in hexadecimal
-    #[garde(ascii)]
-    #[garde(length(min = 0, max = usize::MAX))]
-    pub consignment: String,
-    /// Force Consignment accept
-    #[garde(skip)]
-    pub force: bool,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct AcceptResponse {
-    /// Transfer ID
-    pub transfer_id: String,
-    /// Contract ID
-    pub contract_id: String,
-    /// Transfer accept status
-    pub valid: bool,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-#[derive(Validate)]
-#[garde(context(RGBContext))]
-pub struct RgbSaveTransferRequest {
-    /// The name of the iface (ex: RGB20)
-    #[garde(alphanumeric)]
-    pub iface: String,
-    /// Consignment encoded in hexadecimal
-    #[garde(ascii)]
-    #[garde(length(min = 0, max = usize::MAX))]
-    pub consignment: String,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-#[derive(Validate)]
-#[garde(context(RGBContext))]
-pub struct RgbRemoveTransferRequest {
-    /// Contract ID
-    #[garde(ascii)]
-    #[garde(length(min = 0, max = 100))]
-    pub contract_id: String,
-
-    /// Consignment ID
-    #[garde(length(min = 1, max = 999))]
-    pub consig_ids: Vec<String>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct RgbTransferStatusResponse {
-    /// Contract ID
-    pub contract_id: String,
-    /// Transfer ID
-    pub consig_status: BTreeMap<String, bool>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct ContractsResponse {
-    /// List of available contracts
-    pub contracts: Vec<ContractResponse>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct InterfacesResponse {
-    /// List of available interfaces and implementations
-    pub interfaces: Vec<InterfaceDetail>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct InterfaceDetail {
-    /// Interface Name
-    pub name: String,
-    /// Interface ID
-    pub iface: String,
-    /// Interface ID
-    pub iimpl: String,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct SchemasResponse {
-    /// List of available schemas
-    pub schemas: Vec<SchemaDetail>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct SchemaDetail {
-    /// Schema ID
-    pub schema: String,
-    /// Available Interfaces
-    pub ifaces: Vec<String>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-#[derive(Validate)]
-#[garde(context(RGBContext))]
 pub struct WatcherRequest {
     /// The watcher name
     #[garde(ascii)]
@@ -1081,11 +890,15 @@ pub struct WatcherRequest {
     pub name: String,
     /// The xpub will be watch
     #[garde(ascii)]
-    #[garde(length(min = 1, max = 64))]
-    pub xpub: String,
-    /// Force recreate
+    #[garde(length(min = 1, max = 256))]
+    pub btc_xpub: String,
+    /// The xpub will be watch
+    #[garde(ascii)]
+    #[garde(length(min = 1, max = 256))]
+    pub rgb_xpub: String,
+    /// Recover Mode
     #[garde(skip)]
-    pub force: bool,
+    pub recover: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -1094,82 +907,18 @@ pub struct WatcherResponse {
     /// The watcher name
     pub name: String,
     /// migrate?
+    pub network: String,
+    /// migrate?
     pub migrate: bool,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct WatcherDetailResponse {
-    /// Allocations
-    pub contracts: Vec<WatcherDetail>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct WatcherDetail {
-    /// Contract ID
-    pub contract_id: String,
-    /// Allocations
-    pub allocations: Vec<AllocationDetail>,
-}
-
-#[derive(Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, Debug, Clone, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct AllocationDetail {
-    /// Anchored UTXO
-    pub utxo: String,
-    /// Asset Value
-    pub value: AllocationValue,
-    /// Derivation Path
-    pub derivation: String,
-    /// My Allocation?
-    pub is_mine: bool,
-    /// Allocation spent?
-    pub is_spent: bool,
-}
-
-#[derive(Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, Debug, Clone, Display)]
-#[serde(rename_all = "camelCase")]
-pub enum AllocationValue {
-    #[display(inner)]
-    #[serde(rename = "value")]
-    Value(u64),
-    #[serde(rename = "uda")]
-    UDA(UDAPosition),
-}
-
-impl Default for AllocationValue {
-    fn default() -> Self {
-        AllocationValue::Value(0)
-    }
-}
-
-#[derive(
-    Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, Debug, Clone, Default, Display,
-)]
-#[serde(rename_all = "camelCase")]
-#[display("{token_index}:{fraction}")]
-pub struct UDAPosition {
-    pub token_index: u32,
-    pub fraction: u64,
-}
-
-impl UDAPosition {
-    pub fn with(uda: AllocationUDA) -> Self {
-        UDAPosition {
-            token_index: uda
-                .clone()
-                .token_id()
-                .to_string()
-                .parse()
-                .expect("invalid token_index"),
-            fraction: uda
-                .fraction()
-                .to_string()
-                .parse()
-                .expect("invalid fraction"),
-        }
-    }
+pub struct WatcherStatusResponse {
+    /// The watcher name
+    pub name: String,
+    /// created?
+    pub created: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -1177,17 +926,19 @@ impl UDAPosition {
 pub struct NextAddressResponse {
     pub address: String,
     pub network: String,
+    pub keychain: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct NextUtxoResponse {
-    pub utxo: Option<UtxoResponse>,
+    pub utxo: Option<String>,
+    pub value: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
-pub struct NextUtxosResponse {
+pub struct UnspentUtxoResponse {
     pub utxos: Vec<UtxoResponse>,
 }
 
@@ -1200,266 +951,100 @@ pub struct UtxoResponse {
     pub status: TxStatus,
 }
 
-impl UtxoResponse {
-    pub fn with(outpoint: Outpoint, amount: u64, status: MiningStatus) -> Self {
-        UtxoResponse {
-            amount,
-            outpoint: outpoint.to_string(),
-            status: match status {
-                MiningStatus::Mempool => TxStatus::Mempool,
-                MiningStatus::Blockchain(h) => TxStatus::Block(h),
-            },
-        }
+#[derive(Eq, Ord, PartialEq, PartialOrd, Hash, Serialize, Deserialize, Clone, Debug, Display)]
+#[serde(rename_all = "camelCase")]
+pub enum OrderValue {
+    #[display(inner)]
+    #[serde(rename = "bitcoin")]
+    Bitcoin(u64),
+    #[serde(rename = "contract")]
+    #[display(inner)]
+    Contract(ContractCounterParty),
+}
+
+impl OrderValue {
+    pub fn bitcoin(amount: u64) -> Self {
+        Self::Bitcoin(amount)
+    }
+
+    pub fn contract(kit: ContractCounterParty) -> Self {
+        Self::Contract(kit)
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Eq, Ord, PartialEq, PartialOrd, Hash, Serialize, Deserialize, Clone, Debug, Display)]
 #[serde(rename_all = "camelCase")]
-pub struct WatcherUtxoResponse {
-    pub utxos: Vec<String>,
+#[display("{kit:?}")]
+pub struct ContractCounterParty {
+    pub kit: ContractKit,
+    pub amount: ContractAmount,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct SatsInvoice {
-    pub amount: u64,
-    pub address: Address,
+impl ContractCounterParty {
+    pub fn with(kit: ContractKit, amount: ContractAmount) -> Self {
+        Self { kit, amount }
+    }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct Amount {
-    pub value: u64,
-    pub blinding: String,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct Allocation {
-    pub index: u32,
-    pub node_id: String,
-    pub outpoint: String,
-    pub amount: Amount,
-    pub seal_vout: u32,
-    pub seal_txid: String,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct ExportRequest {
-    /// ContractId of the asset to export FROM the node
-    pub asset: Option<String>,
-    pub genesis: Option<String>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct ExportRequestMini {
-    /// ContractId of the asset to export FROM the node
-    pub asset: String,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct FileMetadata {
-    pub filename: String,
-    pub metadata: [u8; 8],
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct RgbTransfersResponse {
-    /// List of available transfers
-    pub transfers: Vec<RgbTransferDetail>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct RgbTransferDetail {
-    pub consig_id: String,
-    pub status: TxStatus,
-    #[serde(rename = "type")]
-    pub ty: TransferType,
-}
-
-#[derive(
-    Eq, Ord, PartialEq, PartialOrd, Hash, Serialize, Deserialize, Clone, Debug, Display, Default,
-)]
-#[serde(rename_all = "camelCase")]
-pub enum TxStatus {
-    #[default]
-    #[display(inner)]
-    #[serde(rename = "not_found")]
-    NotFound,
-    #[serde(rename = "error")]
-    Error(String),
-    #[serde(rename = "mempool")]
-    Mempool,
-    #[serde(rename = "block")]
-    Block(u32),
-}
-
-#[derive(Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, Clone, Debug, Display)]
-#[serde(rename_all = "camelCase")]
-pub enum TransferType {
-    #[display(inner)]
-    #[serde(rename = "sended")]
-    Sended,
-    #[serde(rename = "received")]
-    Received,
-    #[serde(rename = "unknown")]
-    Unknown,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct RgbInvoiceResponse {
-    pub contract_id: String,
-    pub amount: u64,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct BatchRgbTransferResponse {
-    pub transfers: Vec<BatchRgbTransferItem>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct BatchRgbTransferItem {
-    pub contract_id: String,
-    pub consig_id: String,
-    pub iface: String,
-    pub status: TxStatus,
-    pub is_accept: bool,
-    pub is_mine: bool,
-    pub txid: String,
-}
-
-#[derive(Clone, Eq, PartialEq, PartialOrd, Ord, Hash, Serialize, Deserialize, Debug, Display)]
-#[display("{utxo}:{is_spent}")]
-pub struct UtxoSpentStatus {
-    pub utxo: String,
-    pub is_spent: bool,
-    pub block_height: TxStatus,
-    pub spent_height: TxStatus,
-}
-
-impl UtxoSpentStatus {
-    pub fn is_invalid_state(self) -> bool {
-        matches!(
-            (self.block_height, self.spent_height),
-            (TxStatus::Error(_), _) | (_, TxStatus::Error(_))
-        )
+impl Default for OrderValue {
+    fn default() -> Self {
+        Self::Bitcoin(0)
     }
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Display, Default, Validate)]
-#[garde(context(RGBContext))]
+#[garde(context(RGBValidationOptions))]
 #[serde(rename_all = "camelCase")]
 #[display(doc_comments)]
-pub struct RgbAuctionOfferRequest {
-    #[garde(dive)]
-    pub offers: Vec<RgbOfferRequest>,
-
+pub struct RgbOfferRequest {
+    /// The Offer Strategy
     #[garde(skip)]
-    pub sign_keys: Vec<SecretString>,
-
-    #[garde(skip)]
-    pub strategy: RgbAuctionStrategy,
-
+    pub strategy: RgbSwap,
+    /// Offers
     #[garde(dive)]
-    pub fee: Option<PsbtFeeRequest>,
+    pub offers: Vec<RgbOfferItem>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Display, Default, Validate)]
-#[garde(context(RGBContext))]
+#[garde(context(RGBValidationOptions))]
 #[serde(rename_all = "camelCase")]
-#[display("{contract_id}:{contract_amount} ** {change_terminal}")]
-pub struct RgbOfferRequest {
+#[display("{contract_id}:{contract_amount}@{counter_party}")]
+pub struct RgbOfferItem {
     /// The Contract ID
     #[garde(ascii)]
     #[garde(length(min = 0, max = 100))]
     pub contract_id: String,
-    /// The Contract Interface
-    #[garde(ascii)]
-    #[garde(length(min = 0, max = 32))]
-    pub iface: String,
     /// Contract Amount
     #[garde(skip)]
     pub contract_amount: String,
-    /// Bitcoin Price (in sats)
-    #[garde(range(min = u64::MIN, max = u64::MAX))]
-    pub bitcoin_price: u64,
-    /// Universal Descriptor
-    #[garde(custom(verify_descriptor))]
-    pub descriptor: SecretString,
-    /// Asset Terminal Change
-    #[garde(ascii)]
-    pub change_terminal: String,
-    /// Bitcoin Change Addresses (format: {address}:{amount})
-    #[garde(length(min = 0, max = 999))]
-    pub bitcoin_changes: Vec<String>,
+    /// CounterParty
     #[garde(skip)]
-    pub strategy: RgbSwapStrategy,
+    pub counter_party: OrderValue,
+    /// Offer Expire Date
     #[garde(skip)]
     pub expire_at: Option<i64>,
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug, Display, Default)]
+#[derive(Clone, PartialEq, Serialize, Deserialize, Debug, Display)]
 #[serde(rename_all = "camelCase")]
-#[display("{offer_id}:{contract_amount} = {bitcoin_price}")]
+#[display("{id}:{amount}@{counter_party}")]
 pub struct RgbOfferResponse {
-    /// The Contract ID
-    pub offer_id: String,
-    /// The Contract ID
-    pub contract_id: String,
-    /// Contract Amount
-    pub contract_amount: f64,
-    /// Bitcoin Price
-    pub bitcoin_price: u64,
-    /// Seller Address
-    pub seller_address: String,
-    /// Seller PSBT (encoded in base64)
-    pub seller_psbt: String,
-    /// Bundle ID (collection)
-    pub bundle_id: Option<String>,
+    /// The Order ID
+    pub id: String,
+    /// Order Status
+    pub status: String,
+    /// The Contract Kit
+    pub contract: ContractKit,
+    /// Order Amount
+    pub amount: ContractAmount,
+    /// Counterparty
+    pub counter_party: OrderValue,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Display, Default, Validate)]
-#[garde(context(RGBContext))]
+#[garde(context(RGBValidationOptions))]
 #[serde(rename_all = "camelCase")]
-#[display("{contract_id}:{offer_id}")]
-pub struct RgbOfferUpdateRequest {
-    /// The Contract ID
-    #[garde(ascii)]
-    #[garde(length(min = 0, max = 100))]
-    pub contract_id: String,
-    /// The Offer ID
-    #[garde(ascii)]
-    #[garde(length(min = 0, max = 100))]
-    pub offer_id: String,
-    /// Swap PSBT
-    #[garde(ascii)]
-    pub offer_psbt: String,
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug, Display, Default)]
-#[serde(rename_all = "camelCase")]
-#[display("{offer_id}:{updated}")]
-pub struct RgbOfferUpdateResponse {
-    /// The Contract ID
-    pub contract_id: String,
-    /// The Offer ID
-    pub offer_id: String,
-    /// Updated?
-    pub updated: bool,
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug, Display, Default, Validate)]
-#[garde(context(RGBContext))]
-#[serde(rename_all = "camelCase")]
-#[display("{offer_id}:{asset_amount} ** {change_terminal}")]
+#[display("bid:{offer_id}:{asset_price}")]
 pub struct RgbBidRequest {
     /// The Offer ID
     #[garde(ascii)]
@@ -1467,434 +1052,202 @@ pub struct RgbBidRequest {
     pub offer_id: String,
     /// Asset Amount
     #[garde(skip)]
-    pub asset_amount: String,
-    /// Universal Descriptor
-    #[garde(custom(verify_descriptor))]
-    pub descriptor: SecretString,
-    /// Bitcoin Terminal Change
-    #[garde(ascii)]
-    pub change_terminal: String,
-    /// Bitcoin Fee
+    pub asset_price: OrderValue,
+    /// L1 Fee
     #[garde(dive)]
-    pub fee: PsbtFeeRequest,
+    pub fee: ChainFee,
+    /// Optional Bundle ID (For Auctions)
+    #[garde(skip)]
+    pub bundle_id: Option<String>,
 }
 
-impl From<RgbAuctionBidRequest> for RgbBidRequest {
-    fn from(value: RgbAuctionBidRequest) -> Self {
-        let RgbAuctionBidRequest {
-            offer_id,
-            asset_amount,
-            descriptor,
-            change_terminal,
-            fee,
-            ..
-        } = value;
-        Self {
-            offer_id,
-            asset_amount,
-            descriptor,
-            change_terminal,
-            fee,
-        }
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug, Display, Default)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
-#[display("{bid_id} ~ {offer_id}")]
 pub struct RgbBidResponse {
-    /// The Bid ID
-    pub bid_id: String,
-    /// The Offer ID
+    /// The Order ID
+    pub id: String,
+    /// The Order ID
     pub offer_id: String,
-    /// Buyer Invoice
-    pub invoice: String,
-    /// Final PSBT (encoded in base64)
-    pub swap_psbt: String,
-    /// Fee Value
-    pub fee_value: u64,
+    /// Order Status
+    pub status: String,
+    /// The Asset Kit
+    pub asset: AssetKit,
+    /// Order Amount
+    pub amount: ContractAmount,
+    /// Counterparty
+    pub counter_party: OrderValue,
+    /// Anchor Bitcoin transaction id (non-optional; must be present on successful bid)
+    pub txid: String,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Display, Default, Validate)]
-#[garde(context(RGBContext))]
+#[garde(context(RGBValidationOptions))]
 #[serde(rename_all = "camelCase")]
-#[display("{offer_id}:{asset_amount} ** {change_terminal}")]
-pub struct RgbAuctionBidRequest {
-    /// The Offer ID
+#[display("{bundle_id}")]
+pub struct RgbAuctionCloseRequest {
+    /// Bundle ID
     #[garde(ascii)]
     #[garde(length(min = 0, max = 100))]
-    pub offer_id: String,
-    /// Asset Amount
-    #[garde(skip)]
-    pub asset_amount: String,
-    /// Universal Descriptor
-    #[garde(custom(verify_descriptor))]
-    pub descriptor: SecretString,
-    /// Bitcoin Terminal Change
-    #[garde(ascii)]
-    pub change_terminal: String,
-    /// Descriptors to Sign
-    #[garde(skip)]
-    pub sign_keys: Vec<SecretString>,
-    /// Bitcoin Fee
-    #[garde(dive)]
-    pub fee: PsbtFeeRequest,
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug, Display, Default)]
-#[serde(rename_all = "camelCase")]
-#[display("{bid_id} ~ {offer_id}")]
-pub struct RgbAuctionBidResponse {
-    /// The Bid ID
-    pub bid_id: String,
-    /// The Offer ID
-    pub offer_id: String,
-    /// Fee Value
-    pub fee_value: u64,
+    pub bundle_id: String,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Display, Default, Validate)]
-#[garde(context(RGBContext))]
+#[garde(context(RGBValidationOptions))]
 #[serde(rename_all = "camelCase")]
-#[display("{offer_id} ~ {bid_id}")]
+#[display("{offer_id}:{bid_id}@{shared_key}")]
 pub struct RgbSwapRequest {
-    /// Offer ID
+    /// The Offer ID
     #[garde(ascii)]
     #[garde(length(min = 0, max = 100))]
     pub offer_id: String,
-    /// Bid ID
+    /// The Bid ID
     #[garde(ascii)]
     #[garde(length(min = 0, max = 100))]
     pub bid_id: String,
-    /// Swap PSBT
+    /// The Share Key
     #[garde(ascii)]
-    pub swap_psbt: String,
+    #[garde(length(min = 0, max = 100))]
+    pub shared_key: String,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Display, Default)]
 #[serde(rename_all = "camelCase")]
 #[display("{consig_id}")]
 pub struct RgbSwapResponse {
-    /// Transfer ID
+    /// Consignment ID (in base58)
     pub consig_id: String,
-    /// Final Consig
-    pub final_consig: String,
-    /// Final PSBT
-    pub final_psbt: String,
+    /// Consignment (in armored)
+    pub consig: String,
+    /// L1 Transaction ID
+    pub txid: String,
+    /// PSBT File (in base64)
+    pub psbt: String,
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug, Display, Default)]
-#[serde(rename_all = "camelCase")]
-#[display("{consig_id}")]
-pub struct RgbMatchResponse {
-    /// Transfer ID
-    pub consig_id: String,
-    /// Offer ID
-    pub offer_id: String,
-    /// Bid ID
-    pub bid_id: String,
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug, Display, Default)]
-#[serde(rename_all = "camelCase")]
-#[display("{offer_id} ~ {contract_id}:{asset_amount} = {bitcoin_price}")]
-pub struct RgbAuctionOfferResponse {
-    /// Offer ID
-    pub offer_id: String,
-    /// Contract ID
-    pub contract_id: String,
-    /// Asset/Contract Amount
-    pub asset_amount: u64,
-    /// Bitcoin Price
-    pub bitcoin_price: u64,
-    /// Bundle ID
-    pub bundle_id: String,
-}
-
-impl From<RgbOfferSwap> for RgbAuctionOfferResponse {
-    fn from(value: RgbOfferSwap) -> Self {
-        let RgbOfferSwap {
-            offer_id,
-            contract_id,
-            asset_amount,
-            bitcoin_price,
-            bundle_id,
-            ..
-        } = value;
-
-        Self {
-            offer_id,
-            contract_id,
-            asset_amount,
-            bitcoin_price,
-            bundle_id: bundle_id.unwrap_or_default(),
-        }
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug, Display, Default)]
-#[serde(rename_all = "camelCase")]
-#[display("{bundle_id}")]
-pub struct RgbAuctionFinishResponse {
-    /// Bundle ID
-    pub bundle_id: String,
-    /// New Change Outpoint
-    pub outpoint: String,
-    /// Sold Items
-    pub sold: BTreeMap<String, RgbSwapItem>,
-    /// Reamining Items
-    pub remaining: BTreeMap<String, RgbSwapItem>,
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug, Display, Default)]
-#[serde(rename_all = "camelCase")]
-#[display("{contract_id}:{contract_amount}")]
-pub struct RgbSwapItem {
-    /// Contract ID
-    pub contract_id: String,
-    /// Iface
-    pub iface: String,
-    /// Final Consig
-    pub contract_amount: String,
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug, Display, Default)]
+#[derive(Clone, Serialize, Deserialize, Debug, Display, Default, Validate)]
+#[garde(context(RGBValidationOptions))]
 #[serde(rename_all = "camelCase")]
 #[display("{offers:?}")]
-pub struct PublicRgbOffersResponse {
-    /// Public Offers
-    pub offers: Vec<PublicRgbOfferResponse>,
+pub struct RgbCancelOffersRequest {
+    #[garde(skip)]
+    pub offers: Vec<String>,
+}
 
-    /// Public Bids
-    pub bids: BTreeMap<String, Vec<PublicRgbBidResponse>>,
+#[derive(Clone, Serialize, Deserialize, Debug, Display, Default, Validate)]
+#[garde(context(RGBValidationOptions))]
+#[serde(rename_all = "camelCase")]
+#[display("{bids:?}")]
+pub struct RgbCancelBidsRequest {
+    #[garde(skip)]
+    pub bids: Vec<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Display, Default)]
 #[serde(rename_all = "camelCase")]
-#[display("{offer_id} ~ {contract_id}:{asset_amount} = {bitcoin_price}")]
-pub struct PublicRgbOfferResponse {
-    /// Offer ID
-    offer_id: String,
-    /// Contract ID
-    contract_id: String,
-    /// Offer PubKey
-    offer_pub: String,
-    /// Asset/Contract Amount
-    asset_amount: u64,
-    /// Bitcoin Price
-    bitcoin_price: u64,
-    /// Initial Offer PSBT
-    offer_psbt: Option<String>,
+#[display("{bids:?}")]
+pub struct RgbSwapCancelResponse {
+    pub records: u8,
+    pub offers: Vec<String>,
+    pub bids: Vec<String>,
 }
 
-impl From<RgbOfferSwap> for PublicRgbOfferResponse {
-    fn from(value: RgbOfferSwap) -> Self {
+impl RgbSwapCancelResponse {
+    pub fn cancel_offer(&mut self, offer_id: String) -> Self {
+        self.records += 1;
+        self.offers.push(offer_id);
+        self.clone()
+    }
+
+    pub fn cancel_bid(&mut self, bid_id: String) -> Self {
+        self.records += 1;
+        self.bids.push(bid_id);
+        self.clone()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Display)]
+#[serde(rename_all = "camelCase")]
+#[display("{valid}")]
+pub struct RgbValidationResponse {
+    pub valid: bool,
+    pub message: String,
+    pub warnings: Vec<String>,
+    pub failures: Vec<String>,
+}
+
+impl Default for RgbValidationResponse {
+    fn default() -> Self {
         Self {
-            contract_id: value.contract_id,
-            offer_id: value.offer_id,
-            asset_amount: value.asset_amount,
-            bitcoin_price: value.bitcoin_price,
-            offer_pub: value.pub_key,
-            offer_psbt: value.seller_psbt,
+            valid: true,
+            warnings: vec![],
+            failures: vec![],
+            message: String::default(),
         }
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug, Display, Default)]
-#[serde(rename_all = "camelCase")]
-#[display("{bid_id}:{asset_amount} = {bitcoin_price}")]
-pub struct PublicRgbBidResponse {
-    /// Bid ID
-    bid_id: String,
-    /// Asset/Contract Amount
-    asset_amount: u64,
-    /// Bitcoin Price
-    bitcoin_price: u64,
-}
+impl RgbValidationResponse {
+    pub fn failure(&mut self, failure: String) -> Self {
+        self.valid = false;
+        let (key, message) = failure
+            .as_str()
+            .split_once(':')
+            .map(|(a, b)| (Some(a), Some(b)))
+            .unwrap_or((Some(&failure), None));
 
-impl From<PublicRgbBid> for PublicRgbBidResponse {
-    fn from(value: PublicRgbBid) -> Self {
-        let PublicRgbBid {
-            bid_id,
-            asset_amount,
-            bitcoin_amount,
-            ..
-        } = value;
-
-        Self {
-            bid_id,
-            asset_amount,
-            bitcoin_price: bitcoin_amount,
+        match (key, message) {
+            (Some(key), Some(message)) => {
+                self.failures.push(key.trim().to_string());
+                self.message = message.trim().to_string();
+            }
+            (Some(key), None) => {
+                self.failures.push(key.trim().to_string());
+            }
+            _ => {}
         }
+        self.to_owned()
+    }
+
+    pub fn warning(&mut self, warning: String) -> Self {
+        self.valid = false;
+        let (key, message) = warning
+            .as_str()
+            .split_once(':')
+            .map(|(a, b)| (Some(a), Some(b)))
+            .unwrap_or((Some(&warning), None));
+
+        match (key, message) {
+            (Some(key), Some(_)) => {
+                self.warnings.push(key.to_string());
+                // self.message = message.trim().to_string();
+            }
+            (Some(key), None) => {
+                self.warnings.push(key.trim().to_string());
+            }
+            _ => {}
+        }
+        self.to_owned()
     }
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
 #[serde(rename_all = "camelCase")]
-pub struct RgbOfferBidsResponse {
-    /// Offers
-    pub offers: Vec<RgbOfferDetail>,
-    /// bids
-    pub bids: Vec<RgbBidDetail>,
+pub struct WatcherWalletResponse {
+    pub next_utxo: Option<String>,
+    pub next_utxo_value: Option<u64>,
+    pub next_address: Option<String>,
+    pub list_contracts: Vec<ContractResponse>,
+    pub transfers: Vec<RgbTransferItem>,
+    pub invoices: Vec<RgbInvoiceStatusResponse>,
+    pub offers: Vec<RgbOfferResponse>,
+    pub bids: Vec<RgbBidResponse>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
 #[serde(rename_all = "camelCase")]
-pub struct RgbOffersResponse {
-    /// Offers
-    pub offers: Vec<RgbOfferDetail>,
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct RgbBidsResponse {
-    /// Bids
-    pub bids: Vec<RgbBidDetail>,
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug, Display, Default)]
-#[serde(rename_all = "camelCase")]
-#[display("{offer_id} ~ {contract_id}:{asset_amount} = {bitcoin_price}")]
-pub struct RgbOfferDetail {
-    /// Contract ID
-    contract_id: String,
-    /// Offer ID
-    offer_id: String,
-    /// Offer Status
-    offer_status: String,
-    /// Asset/Contract Amount
-    asset_amount: u64,
-    /// Bitcoin Price
-    bitcoin_price: u64,
-}
-
-impl From<RgbOffer> for RgbOfferDetail {
-    fn from(value: RgbOffer) -> Self {
-        Self {
-            contract_id: value.contract_id,
-            offer_id: value.offer_id,
-            offer_status: value.status.to_string(),
-            asset_amount: value.asset_amount,
-            bitcoin_price: value.bitcoin_price,
-        }
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug, Display, Default)]
-#[serde(rename_all = "camelCase")]
-#[display("{bid_id} ~ {contract_id}:{asset_amount} = {bitcoin_price}")]
-pub struct RgbBidDetail {
-    /// Contract ID
-    contract_id: String,
-    /// Bid ID
-    bid_id: String,
-    /// Offer ID
-    offer_id: String,
-    /// Bid Status
-    bid_status: String,
-    /// Asset/Contract Amount
-    asset_amount: u64,
-    /// Bitcoin Price (in satoshis)
-    bitcoin_price: u64,
-}
-
-impl From<RgbBid> for RgbBidDetail {
-    fn from(value: RgbBid) -> Self {
-        Self {
-            contract_id: value.contract_id,
-            offer_id: value.offer_id,
-            bid_id: value.bid_id,
-            bid_status: value.status.to_string(),
-            asset_amount: value.asset_amount,
-            bitcoin_price: value.bitcoin_amount,
-        }
-    }
-}
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-#[serde(rename_all = "camelCase")]
-#[derive(Validate)]
-#[garde(context(RGBContext))]
-pub struct MediaRequest {
-    #[garde(skip)]
-    pub preview: Option<MediaItemRequest>,
-    #[garde(skip)]
-    pub media: Option<MediaItemRequest>,
-    #[garde(dive)]
-    pub attachments: Vec<MediaItemRequest>,
-}
-
-#[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Clone, Default)]
-#[serde(rename_all = "camelCase")]
-#[derive(Validate)]
-#[garde(context(RGBContext))]
-pub struct MediaItemRequest {
-    /// Media Type
-    #[serde(rename = "type")]
-    #[garde(ascii)]
-    #[garde(length(min = 1, max = 64))]
-    pub ty: String,
-    /// Media URI
-    #[garde(ascii)]
-    #[garde(length(min = u16::MIN.into(), max = u16::MAX.into()))]
-    pub uri: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
-pub struct MediaExtractRequest {
-    pub encode: MediaEncode,
-    pub item: MediaItemRequest,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct MediaResponse {
-    pub preview: Option<MediaView>,
-    pub media: Option<MediaView>,
-    pub attachments: Vec<MediaView>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-#[serde(rename_all = "camelCase")]
-pub enum MediaEncode {
-    #[default]
-    #[serde(rename = "base64")]
-    Base64,
-    #[serde(rename = "sha2")]
-    Sha2,
-    #[serde(rename = "blake3")]
-    Blake3,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-#[serde(rename_all = "camelCase")]
-#[derive(Validate)]
-#[garde(context(RGBContext))]
-pub struct MediaView {
-    /// Media ID
-    #[garde(ascii)]
-    #[garde(length(min = u16::MIN.into(), max = u16::MAX.into()))]
-    pub id: String,
-    /// Media Type
-    #[serde(rename = "type")]
-    #[garde(ascii)]
-    #[garde(length(min = 1, max = 64))]
-    pub ty: String,
-    /// Media Encoded Representation
-    #[garde(ascii)]
-    #[garde(length(min = u16::MIN.into(), max = u16::MAX.into()))]
-    pub source: String,
-    /// Media Encoded Type
-    #[garde(skip)]
-    pub encode: MediaEncode,
-}
-
-impl MediaView {
-    pub fn new(metadata: MediaMetadata, encode: MediaEncode) -> Self {
-        Self {
-            id: metadata.id,
-            ty: metadata.mime,
-            source: metadata.digest,
-            encode,
-        }
-    }
+pub struct AtomicStatsResponse {
+    pub contracts: Vec<String>,
+    pub addresses: Vec<String>,
+    pub slots_free: Vec<UtxoKit>,
+    pub slots_locked: Vec<UtxoKit>,
 }

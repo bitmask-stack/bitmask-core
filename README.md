@@ -11,12 +11,12 @@ Core functionality for the BitMask wallet - <https://bitmask.app>
 
 ## Uses
 
-- [bdk](https://github.com/bitcoindevkit/bdk) - Bitcoin Dev Kit
-- [rgb-wallet](https://github.com/RGB-WG/rgb-wallet) - RGB Wallet
+- [bdk_wallet](https://github.com/bitcoindevkit/bdk_wallet) 3.1 - Bitcoin Dev Kit (BDK 1.x; names testnet4)
+- [rgb-ops](https://github.com/rgb-protocol/rgb-ops) 0.11.1-rc.11 - RGB Protocol on Bitcoin ([docs.rgb.info](https://docs.rgb.info/), accessed: 2026-08-26)
 - [wasm-pack](https://github.com/rustwasm/wasm-pack) - WebAssembly
 - [lndhubx](https://lndhubx.kollider.xyz) - Custodial Lightning
-- [nostr-sdk](https://github.com/rust-nostr/nostr) - Nostr SDK
-- [carbonado](https://github.com/diba-io/carbonado) - Carbonado e2ee decentralized storage
+- [nostr](https://crates.io/crates/nostr/0.44.8) - Nostr 0.44.8 key parse, bech32, and x-only public keys
+- [carbonado](https://crates.io/crates/carbonado/0.7.0) 0.7.0 - Carbonado e2ee decentralized storage (v2 AES-CTR+HMAC; no ECIES v1)
 
 ## Build
 

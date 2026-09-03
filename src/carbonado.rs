@@ -1,7 +1,6 @@
+use crate::{carbonado::error::CarbonadoError, constants::NAMED_NETWORK, info};
 use amplify::hex::ToHex;
-use bitcoin_30::secp256k1::{PublicKey, SecretKey};
-
-use crate::{carbonado::error::CarbonadoError, constants::NETWORK, info, structs::FileMetadata};
+use serde::{Deserialize, Serialize};
 
 pub mod error;
 
@@ -10,23 +9,44 @@ pub mod metrics;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use server::{
-    auctions_retrieve, auctions_store, handle_file, marketplace_retrieve, marketplace_store,
-    retrieve, retrieve_metadata, store,
+    auctions_retrieve, auctions_store, handle_file, local_store, marketplace_retrieve,
+    marketplace_store, retrieve, retrieve_metadata, store,
 };
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct FileMetadata {
+    pub filename: String,
+    pub metadata: [u8; 8],
+}
+
+fn auction_path_segment(part: &str) -> Result<(), CarbonadoError> {
+    if part.is_empty()
+        || part.contains('/')
+        || part.contains('\\')
+        || part.contains('\0')
+        || part.contains("..")
+    {
+        return Err(CarbonadoError::InvalidAuctionBundleId);
+    }
+    Ok(())
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 mod server {
-    use crate::constants::{get_coordinator_nostr_key, get_marketplace_nostr_key};
+    use crate::{
+        constants::{get_coordinator_nostr_key, get_marketplace_nostr_key},
+        debug,
+    };
 
     use super::*;
 
     use std::{
         io::{Error, ErrorKind},
         path::PathBuf,
-        str::FromStr,
     };
 
-    use bitcoin_30::secp256k1::ecdh::SharedSecret;
+    use bpstd::secp256k1::{PublicKey, SecretKey};
     use tokio::fs;
 
     pub async fn store(
@@ -35,10 +55,11 @@ mod server {
         input: &[u8],
         _force: bool,
         metadata: Option<Vec<u8>>,
-    ) -> Result<(), CarbonadoError> {
+    ) -> Result<Vec<u8>, CarbonadoError> {
         let level = 15;
         let sk = hex::decode(sk)?;
-        let secret_key = SecretKey::from_slice(&sk)?;
+        let secret_key =
+            SecretKey::from_slice(&sk).map_err(|_| CarbonadoError::WrongNostrPrivateKey)?;
         let public_key = PublicKey::from_secret_key_global(&secret_key);
         let pk = public_key.serialize();
         let pk_hex = hex::encode(pk);
@@ -50,11 +71,35 @@ mod server {
             meta = Some(inner);
         }
 
-        let (body, _encode_info) = carbonado::file::encode(&sk, Some(&pk), input, level, meta)?;
+        let (body, _encode_info) = carbonado::file::encode(&sk, input, level, meta)?;
         let filepath = handle_file(&pk_hex, name, body.len()).await?;
-        fs::write(&filepath, body).await?;
+        fs::write(&filepath, &body).await?;
         // metrics::update(&filepath).await?;
-        Ok(())
+        Ok(body)
+    }
+
+    pub async fn local_store(
+        sk: &str,
+        input: &[u8],
+        _force: bool,
+        metadata: Option<Vec<u8>>,
+    ) -> Result<Vec<u8>, CarbonadoError> {
+        let level = 15;
+        let sk = hex::decode(sk)?;
+        let secret_key =
+            SecretKey::from_slice(&sk).map_err(|_| CarbonadoError::WrongNostrPrivateKey)?;
+        let _public_key = PublicKey::from_secret_key_global(&secret_key);
+
+        let mut meta: Option<[u8; 8]> = default!();
+        if let Some(metadata) = metadata {
+            let mut inner: [u8; 8] = default!();
+            inner[..metadata.len()].copy_from_slice(&metadata);
+            meta = Some(inner);
+        }
+
+        let (body, _) = carbonado::file::encode(&sk, input, level, meta)?;
+        // metrics::update(&filepath).await?;
+        Ok(body)
     }
 
     pub async fn marketplace_store(
@@ -66,7 +111,8 @@ mod server {
 
         let level = 15;
         let sk = hex::decode(marketplace_key)?;
-        let secret_key = SecretKey::from_slice(&sk)?;
+        let secret_key =
+            SecretKey::from_slice(&sk).map_err(|_| CarbonadoError::WrongNostrPrivateKey)?;
         let public_key = PublicKey::from_secret_key_global(&secret_key);
         let pk = public_key.serialize();
         let pk_hex = hex::encode(pk);
@@ -78,36 +124,39 @@ mod server {
             meta = Some(inner);
         }
 
-        let (body, _encode_info) = carbonado::file::encode(&sk, Some(&pk), input, level, meta)?;
+        let (body, _encode_info) = carbonado::file::encode(&sk, input, level, meta)?;
         let filepath = handle_file(&pk_hex, name, body.len()).await?;
         fs::write(&filepath, body.clone()).await?;
         // metrics::update(&filepath).await?;
+        debug!("marketplace encoded data".to_string());
         Ok((filepath, body))
     }
 
+    fn auction_object_name(bundle_id: &str, name: &str) -> Result<String, CarbonadoError> {
+        auction_path_segment(bundle_id)?;
+        auction_path_segment(name)?;
+        Ok(format!("{bundle_id}-{name}"))
+    }
+
+    /// RGB 0.11 coordinator auction object. Carbonado 0.7 encode with the
+    /// 32-byte coordinator nostr key (same as marketplace_store). bundle_id is
+    /// a filename namespace, not an ECDH bundle pubkey.
     pub async fn auctions_store(
         bundle_id: &str,
         name: &str,
         input: &[u8],
         metadata: Option<Vec<u8>>,
     ) -> Result<(PathBuf, Vec<u8>), CarbonadoError> {
+        let object_name = auction_object_name(bundle_id, name)?;
         let coordinator_key: String = get_coordinator_nostr_key().await;
 
         let level = 15;
-        let coordinator_sk = hex::decode(coordinator_key)?;
-        let coordinator_secret_key = SecretKey::from_slice(&coordinator_sk)?;
-        let bundle_public_key =
-            PublicKey::from_str(bundle_id).map_err(|_| CarbonadoError::WrongNostrPublicKey)?;
-
-        let share_sk = SharedSecret::new(&bundle_public_key, &coordinator_secret_key);
-        let share_sk = share_sk.display_secret().to_string();
-
-        let sk = hex::decode(share_sk)?;
-        let secret_key = SecretKey::from_slice(&sk)?;
+        let sk = hex::decode(coordinator_key)?;
+        let secret_key =
+            SecretKey::from_slice(&sk).map_err(|_| CarbonadoError::WrongNostrPrivateKey)?;
         let public_key = PublicKey::from_secret_key_global(&secret_key);
-
         let pk = public_key.serialize();
-        let pk_hex = public_key.to_hex();
+        let pk_hex = hex::encode(pk);
 
         let mut meta: Option<[u8; 8]> = default!();
         if let Some(metadata) = metadata {
@@ -116,9 +165,10 @@ mod server {
             meta = Some(inner);
         }
 
-        let (body, _encode_info) = carbonado::file::encode(&sk, Some(&pk), input, level, meta)?;
-        let filepath = handle_file(&pk_hex, name, body.len()).await?;
-        fs::write(filepath.clone(), body.clone()).await?;
+        let (body, _encode_info) = carbonado::file::encode(&sk, input, level, meta)?;
+        let filepath = handle_file(&pk_hex, &object_name, body.len()).await?;
+        fs::write(&filepath, body.clone()).await?;
+        debug!("auction encoded data".to_string());
         Ok((filepath, body))
     }
 
@@ -127,16 +177,25 @@ mod server {
         name: &str,
         alt_names: Vec<&String>,
     ) -> Result<(Vec<u8>, Option<Vec<u8>>), CarbonadoError> {
-        use crate::rgb::constants::RGB_STRICT_TYPE_VERSION;
+        use crate::rgb::constants::RGB_ST_INVALID_VERSION;
 
         let sk = hex::decode(sk)?;
-        let secret_key = SecretKey::from_slice(&sk)?;
+        let secret_key =
+            SecretKey::from_slice(&sk).map_err(|_| CarbonadoError::WrongNostrPrivateKey)?;
         let public_key = PublicKey::from_secret_key_global(&secret_key);
         let pk = public_key.to_hex();
 
         let mut final_name = name.to_string();
-        let network = NETWORK.read().await.to_string();
-        let networks = ["bitcoin", "testnet", "signet", "regtest"];
+        let network = NAMED_NETWORK.read().await.to_string();
+        let networks = [
+            "bitcoin",
+            "testnet",
+            "testnet3",
+            "testnet4",
+            "signet",
+            "mutinynet",
+            "regtest",
+        ];
         if !networks.into_iter().any(|x| name.contains(x)) {
             final_name = format!("{network}-{name}");
         }
@@ -153,10 +212,10 @@ mod server {
             let filepath = handle_file(&pk, &alt_name, 0).await?;
             if let Ok(bytes) = fs::read(filepath).await {
                 let (header, decoded) = carbonado::file::decode(&sk, &bytes)?;
-                if let Some(metadata) = header.metadata {
-                    if metadata == RGB_STRICT_TYPE_VERSION {
-                        return Ok((decoded, header.metadata.map(|m| m.to_vec())));
-                    }
+                if let Some(metadata) = header.metadata
+                    && metadata == RGB_ST_INVALID_VERSION
+                {
+                    return Ok((decoded, header.metadata.map(|m| m.to_vec())));
                 }
             }
         }
@@ -170,13 +229,22 @@ mod server {
         let marketplace_key: String = get_marketplace_nostr_key().await;
 
         let sk = hex::decode(marketplace_key)?;
-        let secret_key = SecretKey::from_slice(&sk)?;
+        let secret_key =
+            SecretKey::from_slice(&sk).map_err(|_| CarbonadoError::WrongNostrPrivateKey)?;
         let public_key = PublicKey::from_secret_key_global(&secret_key);
         let pk = public_key.to_hex();
 
         let mut final_name = name.to_string();
-        let network = NETWORK.read().await.to_string();
-        let networks = ["bitcoin", "testnet", "signet", "regtest"];
+        let network = NAMED_NETWORK.read().await.to_string();
+        let networks = [
+            "bitcoin",
+            "testnet",
+            "testnet3",
+            "testnet4",
+            "signet",
+            "mutinynet",
+            "regtest",
+        ];
         if !networks.into_iter().any(|x| name.contains(x)) {
             final_name = format!("{network}-{name}");
         }
@@ -184,6 +252,8 @@ mod server {
         let filepath = handle_file(&pk, &final_name, 0).await?;
         if let Ok(bytes) = fs::read(filepath).await {
             let (header, decoded) = carbonado::file::decode(&sk, &bytes)?;
+
+            debug!("marketplace decoded data".to_string());
             return Ok((decoded, header.metadata.map(|m| m.to_vec())));
         }
 
@@ -194,32 +264,19 @@ mod server {
         bundle_id: &str,
         name: &str,
     ) -> Result<(Vec<u8>, Option<Vec<u8>>), CarbonadoError> {
+        let object_name = auction_object_name(bundle_id, name)?;
         let coordinator_key: String = get_coordinator_nostr_key().await;
 
-        let coordinator_sk = hex::decode(coordinator_key)?;
-        let coordinator_secret_key = SecretKey::from_slice(&coordinator_sk)?;
-        let bundle_public_key =
-            PublicKey::from_str(bundle_id).map_err(|_| CarbonadoError::WrongNostrPublicKey)?;
-
-        let share_sk = SharedSecret::new(&bundle_public_key, &coordinator_secret_key);
-        let share_sk = share_sk.display_secret().to_string();
-
-        let sk = hex::decode(share_sk)?;
-        let secret_key = SecretKey::from_slice(&sk)?;
+        let sk = hex::decode(coordinator_key)?;
+        let secret_key =
+            SecretKey::from_slice(&sk).map_err(|_| CarbonadoError::WrongNostrPrivateKey)?;
         let public_key = PublicKey::from_secret_key_global(&secret_key);
-
         let pk = public_key.to_hex();
 
-        let mut final_name = name.to_string();
-        let network = NETWORK.read().await.to_string();
-        let networks = ["bitcoin", "testnet", "signet", "regtest"];
-        if !networks.into_iter().any(|x| name.contains(x)) {
-            final_name = format!("{network}-{name}");
-        }
-
-        let filepath = handle_file(&pk, &final_name, 0).await?;
+        let filepath = handle_file(&pk, &object_name, 0).await?;
         if let Ok(bytes) = fs::read(filepath).await {
             let (header, decoded) = carbonado::file::decode(&sk, &bytes)?;
+            debug!("auction decoded data".to_string());
             return Ok((decoded, header.metadata.map(|m| m.to_vec())));
         }
 
@@ -232,8 +289,16 @@ mod server {
         bytes: usize,
     ) -> Result<PathBuf, CarbonadoError> {
         let mut final_name = name.to_string();
-        let network = NETWORK.read().await.to_string();
-        let networks = ["bitcoin", "testnet", "signet", "regtest"];
+        let network = NAMED_NETWORK.read().await.to_string();
+        let networks = [
+            "bitcoin",
+            "testnet",
+            "testnet3",
+            "testnet4",
+            "signet",
+            "mutinynet",
+            "regtest",
+        ];
         if !networks.into_iter().any(|x| name.contains(x)) {
             final_name = format!("{network}-{name}");
         }
@@ -244,7 +309,10 @@ mod server {
         .join(pk);
 
         let filepath = directory.join(final_name);
-        let filedir = filepath.parent().unwrap();
+        let filedir = filepath
+            .parent()
+            .ok_or_else(|| CarbonadoError::MissingParent(filepath.clone()))?;
+
         fs::create_dir_all(filedir).await.map_err(|_| {
             CarbonadoError::StdIoError(Error::new(
                 ErrorKind::NotFound,
@@ -265,12 +333,21 @@ mod server {
 
     pub async fn retrieve_metadata(sk: &str, name: &str) -> Result<FileMetadata, CarbonadoError> {
         let sk = hex::decode(sk)?;
-        let secret_key = SecretKey::from_slice(&sk)?;
+        let secret_key =
+            SecretKey::from_slice(&sk).map_err(|_| CarbonadoError::WrongNostrPrivateKey)?;
         let public_key = PublicKey::from_secret_key_global(&secret_key);
         let pk = public_key.to_hex();
 
-        let network = NETWORK.read().await.to_string();
-        let networks = ["bitcoin", "testnet", "signet", "regtest"];
+        let network = NAMED_NETWORK.read().await.to_string();
+        let networks = [
+            "bitcoin",
+            "testnet",
+            "testnet3",
+            "testnet4",
+            "signet",
+            "mutinynet",
+            "regtest",
+        ];
 
         let mut final_name = name.to_string();
         if !networks.into_iter().any(|x| name.contains(x)) {
@@ -293,8 +370,8 @@ mod server {
 
 #[cfg(target_arch = "wasm32")]
 pub use client::{
-    auctions_retrieve, auctions_store, marketplace_retrieve, marketplace_store, retrieve,
-    retrieve_metadata, store,
+    auctions_retrieve, auctions_store, local_store, marketplace_retrieve, marketplace_store,
+    retrieve, retrieve_metadata, store,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -304,12 +381,17 @@ mod client {
     use serde::Deserialize;
     use std::sync::Arc;
     use wasm_bindgen::JsValue;
-    use wasm_bindgen_futures::{future_to_promise, JsFuture};
+    use wasm_bindgen_futures::{JsFuture, future_to_promise};
 
     use gloo_net::http::Request;
     use gloo_utils::errors::JsError;
 
-    use crate::constants::{BITMASK_ENDPOINT, CARBONADO_ENDPOINT};
+    use crate::{
+        constants::{BITMASK_ENDPOINT, CARBONADO_ENDPOINT},
+        // rgb::carbonado::FileMetadata,
+    };
+
+    use bpstd::secp256k1::{PublicKey, SecretKey};
 
     fn js_to_error(js_value: JsValue) -> CarbonadoError {
         CarbonadoError::JsError(js_to_js_error(js_value))
@@ -333,10 +415,11 @@ mod client {
         input: &[u8],
         force: bool,
         metadata: Option<Vec<u8>>,
-    ) -> Result<(), CarbonadoError> {
+    ) -> Result<Vec<u8>, CarbonadoError> {
         let level = 15;
         let sk = hex::decode(sk)?;
-        let secret_key = SecretKey::from_slice(&sk)?;
+        let secret_key =
+            SecretKey::from_slice(&sk).map_err(|_| CarbonadoError::WrongNostrPrivateKey)?;
         let public_key = PublicKey::from_secret_key_global(&secret_key);
         let pk = public_key.serialize();
         let pk_hex = hex::encode(pk);
@@ -348,9 +431,9 @@ mod client {
             meta = Some(inner);
         }
 
-        let (body, _encode_info) = carbonado::file::encode(&sk, Some(&pk), input, level, meta)?;
-        let body = Arc::new(body);
-        let network = NETWORK.read().await.to_string();
+        let (encode_data, _encode_info) = carbonado::file::encode(&sk, input, level, meta)?;
+        let body = Arc::new(encode_data.clone());
+        let network = NAMED_NETWORK.read().await.to_string();
 
         let mut force_write = "";
         if force {
@@ -375,25 +458,56 @@ mod client {
         let results = serde_wasm_bindgen::from_value::<Vec<PostStorePromiseResult>>(results)?;
         let success = results.iter().any(|result| result.value == 200.0);
         if success {
-            Ok(())
+            Ok(encode_data)
         } else {
             Err(CarbonadoError::AllEndpointsFailed)
         }
     }
 
+    pub async fn local_store(
+        sk: &str,
+        input: &[u8],
+        _force: bool,
+        metadata: Option<Vec<u8>>,
+    ) -> Result<Vec<u8>, CarbonadoError> {
+        let level = 15;
+        let sk = hex::decode(sk)?;
+        let secret_key =
+            SecretKey::from_slice(&sk).map_err(|_| CarbonadoError::WrongNostrPrivateKey)?;
+        let _public_key = PublicKey::from_secret_key_global(&secret_key);
+
+        let mut meta: Option<[u8; 8]> = default!();
+        if let Some(metadata) = metadata {
+            let mut inner: [u8; 8] = default!();
+            inner[..metadata.len()].copy_from_slice(&metadata);
+            meta = Some(inner);
+        }
+
+        let (body, _) = carbonado::file::encode(&sk, input, level, meta)?;
+        Ok(body)
+    }
+
     pub async fn marketplace_store(
         name: &str,
         input: &[u8],
-        _metadata: Option<Vec<u8>>,
+        metadata: Option<Vec<u8>>,
     ) -> Result<(), CarbonadoError> {
         let body = Arc::new(input.to_vec());
-        let network = NETWORK.read().await.to_string();
+        let network = NAMED_NETWORK.read().await.to_string();
         let endpoints = CARBONADO_ENDPOINT.read().await.to_string();
         let endpoints: Vec<&str> = endpoints.split(',').collect();
         let requests = Array::new();
 
+        let mut meta: [u8; 8] = default!();
+        if let Some(metadata) = metadata {
+            let mut inner: [u8; 8] = default!();
+            inner[..metadata.len()].copy_from_slice(&metadata);
+            meta = inner;
+        }
+
+        let metadata_version = hex::encode(meta);
         for endpoint in endpoints {
-            let url = format!("{endpoint}/server/{network}-{name}");
+            let url = format!("{endpoint}/server/{metadata_version}/{network}-{name}");
             let fetch_fn = future_to_promise(fetch_post(url, body.clone()));
             requests.push(&fetch_fn);
         }
@@ -417,16 +531,26 @@ mod client {
         bundle_id: &str,
         name: &str,
         input: &[u8],
-        _metadata: Option<Vec<u8>>,
+        metadata: Option<Vec<u8>>,
     ) -> Result<(), CarbonadoError> {
+        auction_path_segment(bundle_id)?;
+        auction_path_segment(name)?;
         let body = Arc::new(input.to_vec());
-        let network = NETWORK.read().await.to_string();
+        let network = NAMED_NETWORK.read().await.to_string();
         let endpoints = BITMASK_ENDPOINT.read().await.to_string();
         let endpoints: Vec<&str> = endpoints.split(',').collect();
         let requests = Array::new();
 
+        let mut meta: [u8; 8] = default!();
+        if let Some(metadata) = metadata {
+            let mut inner: [u8; 8] = default!();
+            inner[..metadata.len()].copy_from_slice(&metadata);
+            meta = inner;
+        }
+
+        let metadata_version = hex::encode(meta);
         for endpoint in endpoints {
-            let url = format!("{endpoint}/auction/{bundle_id}/{network}-{name}");
+            let url = format!("{endpoint}/auction/{bundle_id}/{metadata_version}/{network}-{name}");
             let fetch_fn = future_to_promise(fetch_post(url, body.clone()));
             requests.push(&fetch_fn);
         }
@@ -446,33 +570,6 @@ mod client {
         }
     }
 
-    pub async fn retrieve_metadata(sk: &str, name: &str) -> Result<FileMetadata, CarbonadoError> {
-        let sk = hex::decode(sk)?;
-        let secret_key = SecretKey::from_slice(&sk)?;
-        let public_key = PublicKey::from_secret_key_global(&secret_key);
-        let pk = public_key.to_hex();
-
-        let network = NETWORK.read().await.to_string();
-        let endpoints = CARBONADO_ENDPOINT.read().await.to_string();
-        let endpoints: Vec<&str> = endpoints.split(',').collect();
-
-        let requests = Array::new();
-        for endpoint in endpoints {
-            let url = format!("{endpoint}/{pk}/{network}-{name}/metadata");
-            let fetch_fn = future_to_promise(fetch_get_text(url));
-            requests.push(&fetch_fn);
-        }
-
-        let result = JsFuture::from(Promise::any(&JsValue::from(requests)))
-            .await
-            .map_err(js_to_error)?;
-
-        info!(format!("Retrieve metadata result: {result:?}"));
-
-        let result: FileMetadata = serde_json::from_str(&result.as_string().unwrap())?;
-        Ok(result)
-    }
-
     pub async fn retrieve(
         sk: &str,
         name: &str,
@@ -481,11 +578,12 @@ mod client {
         use carbonado::file::Header;
 
         let sk = hex::decode(sk)?;
-        let secret_key = SecretKey::from_slice(&sk)?;
+        let secret_key =
+            SecretKey::from_slice(&sk).map_err(|_| CarbonadoError::WrongNostrPrivateKey)?;
         let public_key = PublicKey::from_secret_key_global(&secret_key);
         let pk = public_key.to_hex();
 
-        let network = NETWORK.read().await.to_string();
+        let network = NAMED_NETWORK.read().await.to_string();
         let endpoints = CARBONADO_ENDPOINT.read().await.to_string();
         let endpoints: Vec<&str> = endpoints.split(',').collect();
 
@@ -503,7 +601,7 @@ mod client {
         let array = Uint8Array::from(result);
         let encoded = array.to_vec();
 
-        if encoded.len() > Header::len() {
+        if encoded.len() > Header::LEN {
             let (header, decoded) = carbonado::file::decode(&sk, &encoded)?;
             return Ok((decoded, header.metadata.map(|m| m.to_vec())));
         }
@@ -525,7 +623,7 @@ mod client {
             let array = Uint8Array::from(result);
             let encoded = array.to_vec();
 
-            if encoded.len() > Header::len() {
+            if encoded.len() > Header::LEN {
                 let (header, decoded) = carbonado::file::decode(&sk, &encoded)?;
                 return Ok((decoded, header.metadata.map(|m| m.to_vec())));
             }
@@ -537,7 +635,7 @@ mod client {
     pub async fn marketplace_retrieve(
         name: &str,
     ) -> Result<(Vec<u8>, Option<Vec<u8>>), CarbonadoError> {
-        let network = NETWORK.read().await.to_string();
+        let network = NAMED_NETWORK.read().await.to_string();
         let endpoints = CARBONADO_ENDPOINT.read().await.to_string();
         let endpoints: Vec<&str> = endpoints.split(',').collect();
 
@@ -562,7 +660,9 @@ mod client {
         bundle_id: &str,
         name: &str,
     ) -> Result<(Vec<u8>, Option<Vec<u8>>), CarbonadoError> {
-        let network = NETWORK.read().await.to_string();
+        auction_path_segment(bundle_id)?;
+        auction_path_segment(name)?;
+        let network = NAMED_NETWORK.read().await.to_string();
         let endpoints = BITMASK_ENDPOINT.read().await.to_string();
         let endpoints: Vec<&str> = endpoints.split(',').collect();
 
@@ -581,6 +681,36 @@ mod client {
         let encoded = array.to_vec();
 
         Ok((encoded.to_vec(), None))
+    }
+
+    pub async fn retrieve_metadata(sk: &str, name: &str) -> Result<FileMetadata, CarbonadoError> {
+        let sk = hex::decode(sk)?;
+        let secret_key =
+            SecretKey::from_slice(&sk).map_err(|_| CarbonadoError::WrongNostrPrivateKey)?;
+        let public_key = PublicKey::from_secret_key_global(&secret_key);
+        let pk = public_key.to_hex();
+
+        let network = NAMED_NETWORK.read().await.to_string();
+        let endpoints = CARBONADO_ENDPOINT.read().await.to_string();
+        let endpoints: Vec<&str> = endpoints.split(',').collect();
+
+        let requests = Array::new();
+        for endpoint in endpoints {
+            let url = format!("{endpoint}/{pk}/{network}-{name}/metadata");
+            let fetch_fn = future_to_promise(fetch_get_text(url));
+            requests.push(&fetch_fn);
+        }
+
+        let result = JsFuture::from(Promise::any(&JsValue::from(requests)))
+            .await
+            .map_err(js_to_error)?;
+
+        info!(format!("Retrieve metadata result: {result:?}"));
+
+        let result: FileMetadata =
+            serde_json::from_str(&result.as_string().ok_or(CarbonadoError::ResultNotString)?)?;
+
+        Ok(result)
     }
 
     async fn fetch_post(url: String, body: Arc<Vec<u8>>) -> Result<JsValue, JsValue> {

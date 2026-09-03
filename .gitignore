@@ -4,3 +4,6 @@
 wasm-pack.log
 launch.json
 /build
+/result
+/result-*
+.direnv

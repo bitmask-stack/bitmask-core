@@ -1,14 +1,16 @@
 [package]
 name = "bitmask-core"
-version = "0.7.0-beta.11"
+version = "0.12.0"
 authors = [
     "Jose Diego Robles <jose@diba.io>",
     "Hunter Trujillo <hunter@diba.io>",
     "Francisco Calderón <francisco@diba.io>",
     "Armando Dutra <armando@diba.io>",
+    "Trevor O'Farrell <trevor@diba.io>",
 ]
 description = "Core functionality for the BitMask wallet"
-edition = "2021"
+edition = "2024"
+rust-version = "1.98"
 license = "MIT"
 homepage = "https://bitmask.app"
 repository = "https://github.com/diba-io/bitmask-core"
@@ -24,133 +26,197 @@ required-features = ["server"]
 all = []
 default = []
 web = []
-segwit = []
-server = ["tokio/full", "tower-http/cors"]
+server = ["tokio/full", "tokio/fs", "tower-http/cors"]
 
 [dependencies]
-anyhow = "1.0.75"
-amplify = "4.5.0"
-argon2 = "0.5.2"
-automerge = "0.5.2"
-autosurgeon = "0.8"
+# App (Common)
+amplify = "4.8.1"
+anyhow = "1.0"
+chrono = "0.4"
+futures = { version = "0.3", features = ["executor"], default-features = true }
+garde = { version = "0.19", features = ["derive"], default-features = false }
+indexmap = "2.0"
+once_cell = "1.19"
+regex = "1.10.2"
+serde = "1.0"
+serde_json = "1.0"
+thiserror = "1.0"
+walkdir = "2.4"
+
+# Bitcoin. Product types share rust-bitcoin 0.32 with bdk_wallet 3.1
+# (Network::Testnet4). payjoin 1.0.0 uses bitcoin 0.32.
+bip39 = { version = "2.0.0", features = ["rand"] }
+bitcoin = { version = "0.32.8", features = ["base64", "serde"] }
+# BDK 1.x crate family. The deprecated `bdk` 0.28 crate is not a dependency.
+# esplora-client 0.12.3 (via bdk_esplora) uses reqwest 0.12 / h2 0.4.19,
+# so RUSTSEC-2026-0258 (h2 0.3.27) is gone. See SECURITY.md.
+bdk_wallet = "3.1.0"
+# Bitcoin (LNPBP / RGB 0.11)
+bp-wallet = { version = "=0.11.1-alpha.2", default-features = false, features = [
+    "serde",
+    "fs",
+] }
+bp-std = { version = "=0.11.1-alpha.2", features = ["serde"] }
+# stl LIB_ID_BP_CONSENSUS for wasm BTC Carbonado filenames. bp-std 0.11 has no stl module.
+bp-consensus = { version = "=0.11.1-alpha.2", features = ["serde", "stl"] }
+bp-dbc = { version = "=0.11.1-alpha.2", features = ["serde"] }
+
+# Carbonado 0.7.0 on crates.io (v2 AES-CTR+HMAC, 32-byte master keys).
+# No v1 ECIES reader. Do not take bitmask-next's crates.io carbonado 0.4.2.
+# See [crates.io carbonado 0.7.0](https://crates.io/crates/carbonado/0.7.0)
+# (accessed: 2026-08-27).
+carbonado = { version = "0.7.0", default-features = false, features = ["backend-rust"] }
+# Product uses to_allocvec / from_bytes. Default heapless-cas pulls heapless 0.7
+# and atomic-polyfill ([RUSTSEC-2023-0089](https://rustsec.org/advisories/RUSTSEC-2023-0089),
+# accessed: 2026-08-26).
+postcard = { version = "1.0", default-features = false, features = ["alloc"] }
+
+# CRDT (bitmask-next lock: automerge 0.5.7 + autosurgeon 0.8.2)
+automerge = "=0.5.7"
+autosurgeon = "=0.8.2"
+
+# Encoders. RGB 0.11.1-rc.11 companions: rgb-ascii-armor 1.0.2 (lib name armor).
+armor = { package = "rgb-ascii-armor", version = "1.0.2" }
 baid58 = "0.4.4"
 base64 = { package = "base64-compat", version = "1.0.0" }
 base85 = "2.0.0"
 bech32 = "0.9.1"
-bip39 = { version = "2.0.0", features = ["rand"] }
-bitcoin_30 = { package = "bitcoin", version = "0.30", features = ["base64"] }
-bitcoin = { version = "0.29.2", features = ["base64"] }
-bitcoin_hashes = "0.13.0"
-bitcoin_scripts = { version = "0.10.0", default-features = false }
-bitcoin_blockchain = { version = "0.10.0", default-features = false }
-blake3 = "1.5.0"
-bp-core = { version = "0.10.11", features = ["stl"] }
-bp-seals = "0.10.11"
-carbonado = "0.3.6"
-chrono = "0.4"
-commit_verify = { version = "0.10.6", features = ["stl"] }
-console_error_panic_hook = "0.1.7"
-descriptor-wallet = { version = "0.10.1", features = [
-    "serde",
-    "miniscript",
-], default-features = false }
-futures = { version = "0.3.28", features = [
-    "executor",
-], default-features = true }
-garde = { version = "0.16", features = ["derive"], default-features = false }
-rand = "0.8.5"
-getrandom = { version = "0.2.10", features = ["js"] }
 hex = "0.4.3"
-indexmap = "2.0.2"
+
+# Hash Functions
+argon2 = "0.5.2"
+blake3 = "1.5.1"
+
+# LN
 lightning-invoice = "0.26.0"
+
+# Loggers
+console_error_panic_hook = "0.1.7"
 log = "0.4.20"
-miniscript_crate = { package = "miniscript", version = "9.0.2", features = [
-    "compiler",
-] }
-nostr-sdk = "0.25.0"
-once_cell = "1.19.0"
-payjoin = { version = "0.8.0", features = ["send"] }
-postcard = { version = "1.0.7", features = ["alloc"] }
-pretty_env_logger = "0.5.0"
-psbt = { version = "0.10.0-alpha.2", features = [
-    "sign",
-    "miniscript",
-    "serde",
-    "construct",
-] }
-regex = "1.7.0"
-reqwest = { version = "0.11.22", features = ["json", "multipart"] }
-rgb-std = { version = "0.10.9" }
-rgb-wallet = { version = "0.10.9" }
-rgb-schemata = { version = "0.10.1" }
-rgb-contracts = { version = "0.10.2", default-features = false }
-serde = "1.0.189"
-serde_json = "1.0.107"
-serde-encrypt = "0.7.0"
-strict_encoding = "2.6.1"
-strict_types = "1.6.3"
-thiserror = "1.0"
-tokio = { version = "1.33.0", features = ["macros", "sync"] }
-zeroize = "1.6.0"
-walkdir = "2.4.0"
+pretty_env_logger = "0.5"
+
+# Nostr 0.44.7+ (RUSTSEC-2026-0216, 0219, 0225–0230). Same crate family as carbonado-node 0.44.8.
+# Key APIs only: Keys::parse, PublicKey::parse / xonly, ToBech32. Not nostr-sdk 0.26.
+nostr = "0.44.8"
+
+# Payjoin Dev Kit. Newest crates.io release that uses bitcoin 0.32
+# ([payjoin 1.0.0](https://crates.io/crates/payjoin/1.0.0), accessed: 2026-08-27).
+# `v1` is BIP-78 send. Default crate features also enable BIP-77 v2.
+payjoin = { version = "1.0.0", default-features = false, features = ["v1"] }
+
+# Rand
+rand = "0.8"
+
+# RGB Protocol 0.11.1-rc.11 (github.com/rgb-protocol, docs.rgb.info; accessed: 2026-08-26).
+# Not RGB-WG 0.12. Companions: rgb-strict-encoding / rgb-strict-types / rgb-ascii-armor 1.0.2,
+# rgb-aluvm 0.11.1-rc.4 (same day as RC11).
+strict_types = { package = "rgb-strict-types", version = "1.0.2" }
+strict_encoding = { package = "rgb-strict-encoding", version = "1.0.2" }
+rgb-ops = { version = "=0.11.1-rc.11", features = ["serde"] }
+rgb-consensus = { version = "=0.11.1-rc.11", features = ["serde"] }
+rgb-psbt-utils = { version = "=0.11.1-rc.11", features = ["serde", "bp"] }
+rgb-schemas = "=0.11.1-rc.11"
+rgb-api = { version = "=0.11.1-rc.11", features = ["serde", "bp"] }
+rgb-invoicing = { version = "=0.11.1-rc.11", features = ["serde"] }
+bp-seals = { version = "=0.11.1-alpha.2", features = ["serde"] }
+commit_verify = { version = "=0.11.1-alpha.2", features = ["serde"] }
+
+# Security. Wallet descriptors: XChaCha20-Poly1305 + bincode 1.3. Same wire
+# layout as serde-encrypt 0.7 SharedKey (nonce || ciphertext). Do not pull
+# crypto_box / curve25519-dalek 3.2.0 (RUSTSEC-2024-0344).
+# bincode 1.3.3 is unmaintained ([RUSTSEC-2025-0141](https://rustsec.org/advisories/RUSTSEC-2025-0141),
+# accessed: 2026-08-26) with no patched versions. Do not bump to bincode 2:
+# that changes DIBA descriptor plaintext. Known-answer:
+# `bitcoin::wallet_encrypt::decrypts_fixed_serde_encrypt_shared_key_blob`.
+chacha20poly1305 = "0.10.1"
+bincode = "1.3"
+# `derive` re-exports the Zeroize / ZeroizeOnDrop macros. serde-encrypt
+# used to unify that feature; the product crate uses the derives itself.
+zeroize = { version = "1.7.0", features = ["derive"] }
+
+# Web
+nonasync = "0.1.2"
+tokio = { version = "1.33.1", features = ["macros", "sync"] }
+# Product client is reqwest 0.12 / hyper 1. Pin patched h2 (RUSTSEC-2026-0258,
+# patched >=0.4.16). See [the advisory](https://rustsec.org/advisories/RUSTSEC-2026-0258)
+# (accessed: 2026-08-26). BDK esplora-client 0.12.3 is reqwest 0.12; no h2 0.3.
+reqwest = { version = "0.12.28", default-features = true, features = ["json", "multipart"] }
+h2 = "0.4.19"
+# Alias: RGB 0.11 also pulls getrandom 0.3. Unprefixed `getrandom` is ambiguous.
+getrandom_02 = { package = "getrandom", version = "0.2.12" }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-bdk = { version = "0.28.2", features = [
-    "use-esplora-async",
-    "async-interface",
-], default-features = false }
+getrandom = { version = "0.3.3", features = ["wasm_js"] }
+bdk_esplora = { version = "0.22.2", default-features = false, features = [
+    "async",
+] }
+bp-esplora = { version = "=0.11.1-alpha.2", default-features = false, features = [
+    "tokio",
+    "async",
+    "async-https",
+] }
+js-sys = "0.3.70"
+web-sys = { version = "0.3.70", features = ["Worker"] }
+serde-wasm-bindgen = "0.6.3"
+wasm-bindgen = { version = "0.2.100", features = ["serde-serialize"] }
+wasm-bindgen-futures = "0.4.50"
+async-trait = "0.1.83"
+gloo-net = { version = "0.5.0", features = ["http"] }
 gloo-console = "0.3.0"
-gloo-net = { version = "0.4.0", features = ["http"] }
 gloo-utils = "0.2.0"
-js-sys = "0.3.64"
-serde-wasm-bindgen = "0.6.0"
-wasm-bindgen = { version = "0.2.87", features = ["serde-serialize"] }
-wasm-bindgen-futures = "0.4.37"
-web-sys = "0.3.64"
+rexie = "0.6.2"
+# Transitive uuid 1.24.1 compile_error on wasm32 without a RNG source.
+uuid = { version = "1.24.1", default-features = false, features = ["js"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-bdk = { version = "0.28.2", features = [
-    "use-esplora-async",
-    "async-interface",
-    "reqwest-default-tls",
-], default-features = false }
-axum = { version = "0.6.20", features = ["headers"] }
-axum-macros = "0.3.8"
 deflate = "1.0.0"
-esplora_block = { version = "0.5.0", package = "esplora-client", default-features = false, features = [
-    "blocking",
-] }
 inflate = "0.4.5"
-sled = "0.34.7"
-tower-http = { version = "0.4.4", features = ["cors"], optional = true }
+# Native bitmaskd metrics only (not wasm). LMDB via vendored lmdb-master3-sys.
+heed3 = "0.22"
+bdk_esplora = { version = "0.22.2", default-features = false, features = [
+    "async-https",
+    "tokio",
+] }
+bp-esplora = { version = "=0.11.1-alpha.2", default-features = false, features = [
+    "tokio",
+    "blocking",
+    "async",
+    "async-https",
+] }
+axum = { version = "0.7.9", features = ["macros"] }
+axum-extra = { version = "0.9.6", features = ["typed-header"] }
+tower-http = { version = "0.5.2", features = ["cors"], optional = true }
+tokio = { version = "1.33", features = ["full", "fs"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-tokio = { version = "1.33.0", features = ["full"] }
+tokio = { version = "1.33", features = ["full"] }
 
 [dev-dependencies]
-wasm-bindgen-test = "0.3.37"
-
+wasm-bindgen-test = "0.3.50"
+getrandom_02 = { package = "getrandom", version = "0.2.12" }
 
 [build-dependencies]
-anyhow = "1.0.71"
-blake3 = "1.4.1"
-rgb-std = { version = "0.10.2" }
-serde = "1.0.189"
-serde_json = "1.0.107"
-toml = { version = "0.8.0", features = ["preserve_order"] }
+anyhow = "1.0"
+serde = "1.0"
+serde_json = "1.0"
+toml = { version = "0.8.8", default-features = false, features = [
+    "preserve_order",
+] }
+indexmap = { version = "2.2.1", features = ["serde"] }
+built = { version = "0.7", features = ["chrono"] }
+blake3 = "1.5.1"
+rgb-ops = { version = "=0.11.1-rc.11", features = ["serde"] }
+rgb-schemas = "=0.11.1-rc.11"
 
 [patch.crates-io]
-# Remove after merge and release https://github.com/BP-WG/bitcoin_foundation/pull/20
-bitcoin_scripts = { git = "https://github.com/crisdut/bp-foundation", branch = "feat/bump-amplify-4" }
-bitcoin_blockchain = { git = "https://github.com/crisdut/bp-foundation", branch = "feat/bump-amplify-4" }
-
-# Remove after merge and release https://github.com/BP-WG/descriptor-wallet/pull/75
-psbt = { git = "https://github.com/crisdut/descriptor-wallet", branch = "feat/bump-amplify-4" }
-descriptor-wallet = { git = "https://github.com/crisdut/descriptor-wallet", branch = "feat/bump-amplify-4" }
-
-# Remove after merge and release https://github.com/RGB-WG/rgb-wallet/pull/108
-rgb-wallet = { git = "https://github.com/crisdut/rgb-wallet", branch = "feat/improviments" }
-rgb-std = { git = "https://github.com/crisdut/rgb-wallet", branch = "feat/improviments" }
-
-# Remove after merge and release https://github.com/RGB-WG/rgb/pull/32
-rgb-contracts = { git = "https://github.com/crisdut/rgb", branch = "feat/improviments" }
+# Pin git revs (not floating branches) so Nix FOD hashes stay stable.
+# bp-wallet / bp-core / client_side_validation revs match the RGB 0.11.1-rc.11
+# companions that still use that graph. Carbonado is crates.io 0.7.0, not a git pin.
+bp-core = { git = "https://github.com/BP-WG/bp-core", rev = "65394dd178c121eabb6a98b2e0c907d5b558b1c8" }
+bp-dbc = { git = "https://github.com/BP-WG/bp-core", rev = "65394dd178c121eabb6a98b2e0c907d5b558b1c8" }
+bp-seals = { git = "https://github.com/BP-WG/bp-core", rev = "65394dd178c121eabb6a98b2e0c907d5b558b1c8" }
+bp-consensus = { git = "https://github.com/BP-WG/bp-core", rev = "65394dd178c121eabb6a98b2e0c907d5b558b1c8" }
+bp-wallet = { git = "https://github.com/zoedberg/bp-wallet", rev = "e472fe049791b2db6178a8ca592114e127a5dd12" }
+commit_verify = { git = "https://github.com/LNP-BP/client_side_validation", rev = "f896834228cc6dddba0b9ca0337553c41c205cf5" }
+single_use_seals = { git = "https://github.com/LNP-BP/client_side_validation", rev = "f896834228cc6dddba0b9ca0337553c41c205cf5" }
+commit_encoding_derive = { git = "https://github.com/LNP-BP/client_side_validation", rev = "f896834228cc6dddba0b9ca0337553c41c205cf5" }

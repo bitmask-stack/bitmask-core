@@ -1,3 +1,4 @@
+#![cfg(feature = "server")]
 #![cfg(not(target_arch = "wasm32"))]
 
 use anyhow::Result;
