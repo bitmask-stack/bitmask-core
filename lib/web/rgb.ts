@@ -28,10 +28,10 @@ export const psbtSignFile = async (
   JSON.parse(await BMC.psbt_sign_file(nostrHexSk, request));
 
 export const psbtSignAndPublishFile = async (
-  nostrHexSk: string,
+  _nostrHexSk: string,
   request: SignPsbtRequest
 ): Promise<SignedPsbtResponse> =>
-  JSON.parse(await BMC.psbt_sign_and_publish_file(nostrHexSk, request));
+  JSON.parse(await BMC.psbt_sign_and_publish_file(request));
 
 export const transferAsset = async (
   nostrHexSk: string,
@@ -49,7 +49,7 @@ export const importContract = async (
   nostrHexSk: string,
   request: ImportRequest
 ): Promise<ImportResponse> =>
-  JSON.parse(await BMC.import_contract(nostrHexSk, request));
+  JSON.parse(await BMC.import_contract(nostrHexSk, request.data));
 
 export const acceptTransfer = async (
   nostrHexSk: string,
@@ -60,7 +60,7 @@ export const acceptTransfer = async (
 export const listContracts = async (
   nostrHexSk: string
 ): Promise<ContractsResponse> =>
-  JSON.parse(await BMC.list_contracts(nostrHexSk));
+  JSON.parse(await BMC.list_contracts(nostrHexSk, true));
 
 export const hideContract = async (
   nostrHexSk: string,
@@ -92,23 +92,23 @@ export const watcherDetails = async (
 export const watcherNextAddress = async (
   nostrHexSk: string,
   name: string,
-  iface: string
+  _iface: string
 ): Promise<NextAddressResponse> =>
-  JSON.parse(await BMC.watcher_next_address(nostrHexSk, name, iface));
+  JSON.parse(await BMC.watcher_next_address(nostrHexSk, name));
 
 export const watcherNextUtxo = async (
   nostrHexSk: string,
   name: string,
-  iface: string
+  _iface: string
 ): Promise<NextUtxoResponse> =>
-  JSON.parse(await BMC.watcher_next_utxo(nostrHexSk, name, iface));
+  JSON.parse(await BMC.watcher_next_utxo(nostrHexSk, name));
 
 export const watcherUnspentUtxos = async (
   nostrHexSk: string,
   name: string,
-  iface: string
+  _iface: string
 ): Promise<NextUtxosResponse> =>
-  JSON.parse(await BMC.watcher_unspent_utxos(nostrHexSk, name, iface));
+  JSON.parse(await BMC.watcher_unspent_utxos(nostrHexSk, name));
 
 export const watcherAddress = async (
   nostrHexSk: string,
@@ -126,9 +126,9 @@ export const watcherUtxo = async (
 
 export const listTransfers = async (
   nostrHexSk: string,
-  contractId: string
+  _contractId: string
 ): Promise<RgbTransfersResponse> =>
-  JSON.parse(await BMC.list_transfers(nostrHexSk, contractId));
+  JSON.parse(await BMC.list_transfers(nostrHexSk));
 
 export const saveTransfer = async (
   nostrHexSk: string,
@@ -155,13 +155,13 @@ export const createOffer = async (
   nostrHexSk: string,
   request: RgbOfferRequest
 ): Promise<RgbOfferResponse> =>
-  JSON.parse(await BMC.create_offer(nostrHexSk, request));
+  JSON.parse(await BMC.create_offer(nostrHexSk, request, []));
 
 export const createBid = async (
   nostrHexSk: string,
   request: RgbBidRequest
 ): Promise<RgbBidResponse> =>
-  JSON.parse(await BMC.create_bid(nostrHexSk, request));
+  JSON.parse(await BMC.create_bid(nostrHexSk, request, []));
 
 export const createSwap = async (
   nostrHexSk: string,

@@ -4,8 +4,8 @@ use std::env;
 use anyhow::Result;
 use bitmask_core::{
     bitcoin::{
-        BitcoinError, decrypt_wallet, encrypt_wallet, get_wallet_data, hash_password, new_wallet,
-        send_sats,
+        BitcoinError, bump_fee, decrypt_wallet, encrypt_wallet, get_wallet_data, hash_password,
+        new_wallet, send_sats,
     },
     constants::{get_network, switch_network},
     structs::SecretString,
@@ -228,6 +228,44 @@ async fn wrong_network() -> Result<()> {
     .await;
 
     assert!(matches!(result, Err(BitcoinError::WrongNetwork)));
+
+    Ok(())
+}
+
+/// Unknown txid with `broadcast: false` does not sync Esplora. `build_fee_bump`
+/// on a wallet that never saw the tx is `BdkFeeBumpError`. Name is not
+/// `create_wallet` so Nix nextest runs it.
+#[tokio::test]
+async fn bump_fee_unknown_txid_is_bdk_fee_bump_error() -> Result<()> {
+    init_logging("wallet=info");
+
+    switch_network("bitcoin").await?;
+
+    const MNEMONIC: &str = "empty faculty salute fortune select asthma attract question violin movie smile erupt half step lion deposit render stumble double mobile fossil height usual topple";
+
+    let hash = hash_password(&SecretString(ENCRYPTION_PASSWORD.to_owned()))?;
+    let encrypted = encrypt_wallet(
+        &SecretString(MNEMONIC.to_owned()),
+        &hash,
+        &SecretString(SEED_PASSWORD.to_owned()),
+    )
+    .await?;
+
+    let decrypted = decrypt_wallet(&hash, &encrypted, &SecretString("".to_owned())).await?;
+
+    let txid = "0000000000000000000000000000000000000000000000000000000000000001";
+    let err = bump_fee(
+        txid.into(),
+        2.0,
+        &SecretString(decrypted.private.btc_descriptor_xprv.clone()),
+        Some(&SecretString(
+            decrypted.private.btc_change_descriptor_xprv.clone(),
+        )),
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, BitcoinError::BdkFeeBumpError(_)));
 
     Ok(())
 }

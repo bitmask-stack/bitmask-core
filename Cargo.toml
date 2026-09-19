@@ -13,7 +13,7 @@ edition = "2024"
 rust-version = "1.98"
 license = "MIT"
 homepage = "https://bitmask.app"
-repository = "https://github.com/diba-io/bitmask-core"
+repository = "https://github.com/bitmask-stack/bitmask-core"
 
 [lib]
 crate-type = ["cdylib", "rlib"]

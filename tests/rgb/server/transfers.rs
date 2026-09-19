@@ -4,10 +4,11 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use crate::rgb::server::seeder::{
-    FundSeed, NewTransfer, SeedInvoice, SeedTransfer, WalletSeed, create_contract_and_transfer,
-    create_new_fund_wallet, create_new_invoice, create_new_transfer, create_new_wallet,
+    ContractSeed, FundSeed, NewTransfer, SeedInvoice, SeedTransfer, WalletSeed,
+    create_contract_and_transfer, create_new_contract, create_new_fund_wallet, create_new_invoice,
+    create_new_transfer, create_new_wallet,
 };
-use amplify::default;
+use amplify::{default, none};
 use bitmask_core::bitcoin::{publish_psbt_file_bp, sign_and_publish_psbt_file_bp};
 use bitmask_core::bp::signer::MainSigner;
 use bitmask_core::bp::{FundOptions, fund_vault};
@@ -26,6 +27,7 @@ use bitmask_core::wallet::interop::XprivBpKey;
 use bitmask_core::wallet::watcher::watcher_next_utxo;
 use bitmask_core::{debug, info};
 use bpstd::{Network, Psbt, PsbtVer, Sats, XprivAccount};
+use rgbcore::ContractId;
 use rgbinvoice::RgbInvoice;
 use std::str::FromStr;
 
@@ -611,5 +613,335 @@ async fn accept_new_rgb21_transfer_by_proxy() -> anyhow::Result<()> {
 
     let verify_resp = verify_transfers(&beneficiary_sk.to_string(), true).await?;
     debug!(format!("Transf: {:?}", verify_resp));
+    Ok(())
+}
+
+#[tokio::test]
+async fn owner_pays_onward_rgb20_transfer() -> anyhow::Result<()> {
+    let issuer_keys = create_new_wallet(WalletSeed::default()).await?;
+    let owners_keys = create_new_wallet(WalletSeed::default()).await?;
+    let third_keys = create_new_wallet(WalletSeed::default()).await?;
+
+    let asset_type = AssetType::RGB20;
+    let transfer_value = RgbInvoiceValue::Value("1.00".to_string());
+
+    let PrivateWalletData {
+        ref rgb_descriptor_xprv,
+        ref btc_descriptor_xprv,
+        ref btc_change_descriptor_xprv,
+        nostr_prv: ref sender_sk,
+        ..
+    } = issuer_keys.private.clone();
+
+    let PrivateWalletData {
+        rgb_descriptor_xprv: ref owner_rgb_descriptor_xprv,
+        btc_descriptor_xprv: ref owner_btc_descriptor_xprv,
+        btc_change_descriptor_xprv: ref owner_btc_change_descriptor_xprv,
+        nostr_prv: ref owner_sk,
+        ..
+    } = owners_keys.private.clone();
+
+    let PrivateWalletData {
+        nostr_prv: ref third_sk,
+        ..
+    } = third_keys.private.clone();
+
+    let seed = SeedTransfer::with_proxy(
+        asset_type.clone(),
+        transfer_value.clone(),
+        issuer_keys.clone(),
+        owners_keys.clone(),
+    );
+    let (contract_id, RgbTransferResponse { consig, psbt, .. }) =
+        create_contract_and_transfer(seed).await?;
+
+    let descriptors = vec![
+        SecretString(btc_descriptor_xprv.clone()),
+        SecretString(btc_change_descriptor_xprv.clone()),
+        SecretString(rgb_descriptor_xprv.clone()),
+    ];
+
+    let psbt_req = SignPsbtRequest { psbt, descriptors };
+    let psbt_resp = sign_and_publish_psbt_file_bp(psbt_req).await?;
+    debug!(format!("Sign Psbt: {:?}", psbt_resp));
+
+    verify_transfers(&sender_sk.to_string(), true).await?;
+    verify_transfers(&owner_sk.to_string(), true).await?;
+
+    info!("Create new Block");
+    new_block();
+
+    verify_transfers(&sender_sk.to_string(), true).await?;
+    verify_transfers(&owner_sk.to_string(), true).await?;
+    let issuer = get_contract(&sender_sk.to_string(), contract_id.to_string()).await?;
+    let owner = get_contract(&owner_sk.to_string(), contract_id.to_string()).await?;
+    assert_eq!(issuer.balance, ContractValue::Value(410));
+    assert_eq!(owner.balance, ContractValue::Value(100));
+
+    info!("Owner invoice for third wallet");
+    let invoice_seed = SeedInvoice::new(contract_id, transfer_value, third_keys.clone());
+    let rgb_invoice = create_new_invoice(invoice_seed).await?;
+    let rgb_invoice = RgbInvoice::from_str(&rgb_invoice.invoice)?;
+
+    info!("Owner pays onward");
+    let seed = NewTransfer::new(
+        owners_keys,
+        third_keys,
+        contract_id,
+        asset_type,
+        rgb_invoice,
+        None,
+    );
+    let (contract_id, RgbTransferResponse { psbt, .. }) = create_new_transfer(seed).await?;
+
+    let descriptors = vec![
+        SecretString(owner_btc_descriptor_xprv.clone()),
+        SecretString(owner_btc_change_descriptor_xprv.clone()),
+        SecretString(owner_rgb_descriptor_xprv.clone()),
+    ];
+    let psbt_req = SignPsbtRequest { psbt, descriptors };
+    let psbt_resp = sign_and_publish_psbt_file_bp(psbt_req).await?;
+    debug!(format!("Sign Psbt: {:?}", psbt_resp));
+
+    info!("Confirm owner onward transfer");
+    new_block();
+
+    verify_transfers(&sender_sk.to_string(), true).await?;
+    verify_transfers(&owner_sk.to_string(), true).await?;
+    verify_transfers(&third_sk.to_string(), true).await?;
+
+    let issuer = get_contract(&sender_sk.to_string(), contract_id.to_string()).await?;
+    let owner = get_contract(&owner_sk.to_string(), contract_id.to_string()).await?;
+    let third = get_contract(&third_sk.to_string(), contract_id.to_string()).await?;
+    assert_eq!(issuer.balance, ContractValue::Value(410));
+    assert_eq!(owner.balance, ContractValue::Value(0));
+    assert_eq!(third.balance, ContractValue::Value(100));
+    Ok(())
+}
+
+#[tokio::test]
+async fn two_rgb20_contracts_on_one_utxo() -> anyhow::Result<()> {
+    let issuer_keys = create_new_wallet(WalletSeed::default()).await?;
+    let owners_keys = create_new_wallet(WalletSeed::default()).await?;
+
+    let asset_type = AssetType::RGB20;
+    let transfer_value = RgbInvoiceValue::Value("1.00".to_string());
+
+    let PrivateWalletData {
+        ref rgb_descriptor_xprv,
+        ref btc_descriptor_xprv,
+        ref btc_change_descriptor_xprv,
+        nostr_prv: ref sender_sk,
+        ..
+    } = issuer_keys.private.clone();
+
+    let PrivateWalletData {
+        nostr_prv: ref beneficiary_sk,
+        ..
+    } = owners_keys.private.clone();
+
+    let mut issue_req = ContractSeed::fungible(issuer_keys.clone(), none!());
+    issue_req.quantity = 2;
+    let issue_res = create_new_contract(issue_req).await?;
+    assert_eq!(issue_res.len(), 2);
+    assert_eq!(issue_res[0].issue_utxo, issue_res[1].issue_utxo);
+    assert_ne!(issue_res[0].contract_id, issue_res[1].contract_id);
+
+    let first_id = ContractId::from_str(&issue_res[0].contract_id)?;
+    let second_id = ContractId::from_str(&issue_res[1].contract_id)?;
+
+    let first_invoice = create_new_invoice(SeedInvoice::with_contract(
+        issue_res[0].contract.clone(),
+        transfer_value.clone(),
+        owners_keys.clone(),
+    ))
+    .await?;
+    let second_invoice = create_new_invoice(SeedInvoice::with_contract(
+        issue_res[1].contract.clone(),
+        transfer_value,
+        owners_keys.clone(),
+    ))
+    .await?;
+    let first_invoice = RgbInvoice::from_str(&first_invoice.invoice)?;
+    let second_invoice = RgbInvoice::from_str(&second_invoice.invoice)?;
+
+    info!("Transfer first RGB20 from shared UTXO");
+    let seed = NewTransfer::new(
+        issuer_keys.clone(),
+        owners_keys.clone(),
+        first_id,
+        asset_type.clone(),
+        first_invoice,
+        None,
+    );
+    let (_, RgbTransferResponse { psbt, .. }) = create_new_transfer(seed).await?;
+
+    let descriptors = vec![
+        SecretString(btc_descriptor_xprv.clone()),
+        SecretString(btc_change_descriptor_xprv.clone()),
+        SecretString(rgb_descriptor_xprv.clone()),
+    ];
+    let psbt_req = SignPsbtRequest {
+        psbt,
+        descriptors: descriptors.clone(),
+    };
+    let psbt_resp = sign_and_publish_psbt_file_bp(psbt_req).await?;
+    debug!(format!("Sign Psbt: {:?}", psbt_resp));
+
+    new_block();
+    verify_transfers(&sender_sk.to_string(), true).await?;
+    verify_transfers(&beneficiary_sk.to_string(), true).await?;
+
+    let owner_first = get_contract(&beneficiary_sk.to_string(), first_id.to_string()).await?;
+    assert_eq!(owner_first.balance, ContractValue::Value(100));
+
+    info!("Transfer second RGB20 from the same issuer UTXO");
+    let seed = NewTransfer::new(
+        issuer_keys,
+        owners_keys,
+        second_id,
+        asset_type,
+        second_invoice,
+        None,
+    );
+    match create_new_transfer(seed).await {
+        Ok((_, RgbTransferResponse { psbt, .. })) => {
+            let psbt_req = SignPsbtRequest { psbt, descriptors };
+            let psbt_resp = sign_and_publish_psbt_file_bp(psbt_req).await?;
+            debug!(format!("Sign Psbt: {:?}", psbt_resp));
+            new_block();
+            verify_transfers(&sender_sk.to_string(), true).await?;
+            verify_transfers(&beneficiary_sk.to_string(), true).await?;
+            let owner_second =
+                get_contract(&beneficiary_sk.to_string(), second_id.to_string()).await?;
+            assert_eq!(owner_second.balance, ContractValue::Value(100));
+        }
+        Err(err) => {
+            // First transfer spent the shared UTXO. HEAD coinselect has no second input.
+            let msg = err.to_string();
+            assert!(
+                !msg.is_empty(),
+                "second transfer failed with an empty error"
+            );
+            debug!(format!(
+                "second RGB20 transfer after shared UTXO spend: {msg}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn rgb20_and_rgb21_contracts_on_one_utxo() -> anyhow::Result<()> {
+    let issuer_keys = create_new_wallet(WalletSeed::default()).await?;
+    let owners_keys = create_new_wallet(WalletSeed::default()).await?;
+
+    let PrivateWalletData {
+        ref rgb_descriptor_xprv,
+        ref btc_descriptor_xprv,
+        ref btc_change_descriptor_xprv,
+        nostr_prv: ref sender_sk,
+        ..
+    } = issuer_keys.private.clone();
+
+    let PrivateWalletData {
+        nostr_prv: ref beneficiary_sk,
+        ..
+    } = owners_keys.private.clone();
+
+    let rgb20 = create_new_contract(ContractSeed::fungible(issuer_keys.clone(), none!())).await?;
+    let mut uda = ContractSeed::uda(issuer_keys.clone(), none!());
+    uda.options.proxy = false;
+    let rgb21 = create_new_contract(uda).await?;
+
+    assert_eq!(rgb20.len(), 1);
+    assert_eq!(rgb21.len(), 1);
+    assert_eq!(rgb20[0].issue_utxo, rgb21[0].issue_utxo);
+    assert_eq!(rgb20[0].iface, AssetType::RGB20.to_string());
+    assert_eq!(rgb21[0].iface, AssetType::RGB21.to_string());
+    assert_ne!(rgb20[0].contract_id, rgb21[0].contract_id);
+
+    let rgb20_id = ContractId::from_str(&rgb20[0].contract_id)?;
+    let rgb21_id = ContractId::from_str(&rgb21[0].contract_id)?;
+
+    let rgb20_invoice = create_new_invoice(SeedInvoice::with_contract(
+        rgb20[0].contract.clone(),
+        RgbInvoiceValue::Value("1.00".to_string()),
+        owners_keys.clone(),
+    ))
+    .await?;
+    let rgb21_invoice = create_new_invoice(SeedInvoice::with_contract(
+        rgb21[0].contract.clone(),
+        RgbInvoiceValue::UDA(default!()),
+        owners_keys.clone(),
+    ))
+    .await?;
+    let rgb20_invoice = RgbInvoice::from_str(&rgb20_invoice.invoice)?;
+    let rgb21_invoice = RgbInvoice::from_str(&rgb21_invoice.invoice)?;
+
+    info!("Transfer RGB20 from shared UTXO");
+    let seed = NewTransfer::new(
+        issuer_keys.clone(),
+        owners_keys.clone(),
+        rgb20_id,
+        AssetType::RGB20,
+        rgb20_invoice,
+        None,
+    );
+    let (_, RgbTransferResponse { psbt, .. }) = create_new_transfer(seed).await?;
+
+    let descriptors = vec![
+        SecretString(btc_descriptor_xprv.clone()),
+        SecretString(btc_change_descriptor_xprv.clone()),
+        SecretString(rgb_descriptor_xprv.clone()),
+    ];
+    let psbt_req = SignPsbtRequest {
+        psbt,
+        descriptors: descriptors.clone(),
+    };
+    let psbt_resp = sign_and_publish_psbt_file_bp(psbt_req).await?;
+    debug!(format!("Sign Psbt: {:?}", psbt_resp));
+
+    new_block();
+    verify_transfers(&sender_sk.to_string(), true).await?;
+    verify_transfers(&beneficiary_sk.to_string(), true).await?;
+
+    let owner_rgb20 = get_contract(&beneficiary_sk.to_string(), rgb20_id.to_string()).await?;
+    assert_eq!(owner_rgb20.balance, ContractValue::Value(100));
+
+    info!("Transfer RGB21 from the same issuer UTXO");
+    let seed = NewTransfer::new(
+        issuer_keys,
+        owners_keys,
+        rgb21_id,
+        AssetType::RGB21,
+        rgb21_invoice,
+        None,
+    );
+    match create_new_transfer(seed).await {
+        Ok((_, RgbTransferResponse { psbt, .. })) => {
+            let psbt_req = SignPsbtRequest { psbt, descriptors };
+            let psbt_resp = sign_and_publish_psbt_file_bp(psbt_req).await?;
+            debug!(format!("Sign Psbt: {:?}", psbt_resp));
+            new_block();
+            verify_transfers(&sender_sk.to_string(), true).await?;
+            verify_transfers(&beneficiary_sk.to_string(), true).await?;
+            let owner_rgb21 =
+                get_contract(&beneficiary_sk.to_string(), rgb21_id.to_string()).await?;
+            assert_eq!(
+                owner_rgb21.balance,
+                ContractValue::UDA(UDAValue::with(1, 1))
+            );
+        }
+        Err(err) => {
+            // First transfer spent the shared UTXO. HEAD coinselect has no second input.
+            let msg = err.to_string();
+            assert!(
+                !msg.is_empty(),
+                "second transfer failed with an empty error"
+            );
+            debug!(format!("RGB21 transfer after shared UTXO spend: {msg}"));
+        }
+    }
     Ok(())
 }

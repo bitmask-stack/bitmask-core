@@ -7,9 +7,10 @@ export const hashPassword = (password: string) => BMC.hash_password(password);
 
 export const decryptWallet = async (
   hash: string,
-  encryptedDescriptors: string
+  encryptedDescriptors: string,
+  seedPassword = ""
 ): Promise<Vault> =>
-  JSON.parse(await BMC.decrypt_wallet(hash, encryptedDescriptors));
+  JSON.parse(await BMC.decrypt_wallet(hash, encryptedDescriptors, seedPassword));
 
 export const upgradeWallet = async (
   hash: string,
@@ -51,36 +52,42 @@ export const sendSats = async (
   changeDescriptor: string,
   address: string,
   amount: bigint,
-  feeRate: number
+  feeRate: number,
+  broadcast = true
 ): Promise<TransactionData> =>
   JSON.parse(
-    await BMC.send_sats(descriptor, changeDescriptor, address, amount, feeRate)
+    await BMC.send_sats(
+      descriptor,
+      changeDescriptor,
+      address,
+      amount,
+      broadcast,
+      feeRate
+    )
   );
 
 export const fundVault = async (
   descriptor: string,
   changeDescriptor: string,
-  assetAddress1: string,
-  udaAddress1: string,
-  feeRate: number
+  rgbAddress: string,
+  feeRate: number,
+  broadcast = true
 ): Promise<FundVaultDetails> =>
   JSON.parse(
     await BMC.fund_vault(
       descriptor,
       changeDescriptor,
-      assetAddress1,
-      udaAddress1,
+      rgbAddress,
+      broadcast,
       feeRate
     )
   );
 
 export const getAssetsVault = async (
   rgbAssetsDescriptorXpub: string,
-  rgbUdasDescriptorXpub: string
+  _rgbUdasDescriptorXpub?: string
 ): Promise<FundVaultDetails> =>
-  JSON.parse(
-    await BMC.get_assets_vault(rgbAssetsDescriptorXpub, rgbUdasDescriptorXpub)
-  );
+  JSON.parse(await BMC.get_assets_vault(rgbAssetsDescriptorXpub));
 
 export const drainWallet = async (
   destination: string,

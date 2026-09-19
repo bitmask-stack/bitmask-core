@@ -730,6 +730,48 @@ pub mod rgb {
     };
     use wasm_bindgen::prelude::wasm_bindgen;
 
+    fn remap_issue_request(request: JsValue) -> JsValue {
+        let mut v: serde_json::Value =
+            serde_wasm_bindgen::from_value(request).unwrap_or(serde_json::Value::Null);
+        if let serde_json::Value::Object(ref mut map) = v
+            && let Some(supply) = map.get("supply")
+            && !supply.is_string()
+        {
+            let s = match supply {
+                serde_json::Value::Number(n) => n.to_string(),
+                other => other.to_string().trim_matches('"').to_string(),
+            };
+            map.insert("supply".into(), serde_json::Value::String(s));
+        }
+        serde_wasm_bindgen::to_value(&v).unwrap_or(JsValue::NULL)
+    }
+
+    fn remap_full_transfer_request(request: JsValue) -> JsValue {
+        let mut v: serde_json::Value =
+            serde_wasm_bindgen::from_value(request).unwrap_or(serde_json::Value::Null);
+        if let serde_json::Value::Object(ref mut map) = v {
+            if !map.contains_key("invoice")
+                && let Some(inv) = map.get("rgbInvoice").cloned()
+            {
+                map.insert("invoice".into(), inv);
+            }
+            if !map.contains_key("chainFee")
+                && let Some(fee) = map.get("fee").cloned()
+            {
+                map.insert("chainFee".into(), fee);
+            }
+        }
+        serde_wasm_bindgen::to_value(&v).unwrap_or(JsValue::NULL)
+    }
+
+    fn rgb011_removed(name: &'static str) -> Promise {
+        future_to_promise(async move {
+            Err(JsValue::from_string(format!(
+                "{name} is not on RGB Protocol 0.11.1-rc.11"
+            )))
+        })
+    }
+
     #[wasm_bindgen]
     pub fn get_rgb_version() -> String {
         set_panic_hook();
@@ -812,6 +854,12 @@ pub mod rgb {
         })
     }
 
+    /// TypeScript `BMC.full_issue_contract`. Same live 0.11 issue path as `issue_contract`.
+    #[wasm_bindgen]
+    pub fn full_issue_contract(nostr_hex_sk: String, request: JsValue) -> Promise {
+        issue_contract(nostr_hex_sk, remap_issue_request(request))
+    }
+
     #[wasm_bindgen]
     pub fn issue_contract_proxy(nostr_hex_sk: String, request: JsValue) -> Promise {
         set_panic_hook();
@@ -845,6 +893,12 @@ pub mod rgb {
                 Err(err) => Err(JsValue::from_string(RgbError::Invoice(err).to_string())),
             }
         })
+    }
+
+    /// TypeScript `BMC.rgb_create_invoice`.
+    #[wasm_bindgen]
+    pub fn rgb_create_invoice(nostr_hex_sk: String, request: JsValue) -> Promise {
+        create_rgb_invoice(nostr_hex_sk, request)
     }
 
     #[wasm_bindgen]
@@ -891,6 +945,12 @@ pub mod rgb {
         })
     }
 
+    /// TypeScript `BMC.decode_invoice`.
+    #[wasm_bindgen]
+    pub fn decode_invoice(invoice: String) -> Promise {
+        decode_rgb_invoice(invoice)
+    }
+
     #[wasm_bindgen]
     pub fn can_create_transfer_contract(nostr_hex_sk: String, request: JsValue) -> Promise {
         set_panic_hook();
@@ -921,6 +981,18 @@ pub mod rgb {
                 Err(err) => Err(JsValue::from_string(RgbError::Transfer(err).to_string())),
             }
         })
+    }
+
+    /// TypeScript `BMC.transfer_asset`. Live 0.11 `transfer_contract` / `create_rgb_transfer`.
+    #[wasm_bindgen]
+    pub fn transfer_asset(nostr_hex_sk: String, request: JsValue) -> Promise {
+        create_rgb_transfer(nostr_hex_sk, remap_full_transfer_request(request))
+    }
+
+    /// TypeScript `BMC.full_transfer_asset`. Same live 0.11 transfer path.
+    #[wasm_bindgen]
+    pub fn full_transfer_asset(nostr_hex_sk: String, request: JsValue) -> Promise {
+        create_rgb_transfer(nostr_hex_sk, remap_full_transfer_request(request))
     }
 
     #[wasm_bindgen]
@@ -1032,6 +1104,12 @@ pub mod rgb {
         })
     }
 
+    /// TypeScript `BMC.public_offers`.
+    #[wasm_bindgen]
+    pub fn public_offers(nostr_hex_sk: String) -> Promise {
+        list_offers(nostr_hex_sk)
+    }
+
     #[wasm_bindgen]
     pub fn offers(nostr_hex_sk: String) -> Promise {
         set_panic_hook();
@@ -1046,6 +1124,18 @@ pub mod rgb {
         })
     }
 
+    /// TypeScript `BMC.my_offers`.
+    #[wasm_bindgen]
+    pub fn my_offers(nostr_hex_sk: String) -> Promise {
+        offers(nostr_hex_sk)
+    }
+
+    /// TypeScript `BMC.my_orders` (offers only; bids are `my_bids`).
+    #[wasm_bindgen]
+    pub fn my_orders(nostr_hex_sk: String) -> Promise {
+        offers(nostr_hex_sk)
+    }
+
     #[wasm_bindgen]
     pub fn bids(nostr_hex_sk: String) -> Promise {
         set_panic_hook();
@@ -1058,6 +1148,12 @@ pub mod rgb {
                 Err(err) => Err(JsValue::from_string(RgbError::Swap(err).to_string())),
             }
         })
+    }
+
+    /// TypeScript `BMC.my_bids`.
+    #[wasm_bindgen]
+    pub fn my_bids(nostr_hex_sk: String) -> Promise {
+        bids(nostr_hex_sk)
     }
 
     #[wasm_bindgen]
@@ -1182,6 +1278,120 @@ pub mod rgb {
                 Err(err) => Err(JsValue::from_string(RgbError::Swap(err).to_string())),
             }
         })
+    }
+
+    #[wasm_bindgen]
+    pub fn get_consignment(consig_or_receipt_id: String) -> Promise {
+        set_panic_hook();
+        future_to_promise(async move {
+            match crate::rgb::proxy::get_consignment(&consig_or_receipt_id).await {
+                Ok(result) => Ok(JsValue::from_string(
+                    serde_json::to_string(&result).unwrap(),
+                )),
+                Err(err) => Err(JsValue::from_string(err.to_string())),
+            }
+        })
+    }
+
+    #[wasm_bindgen]
+    pub fn get_media_metadata(media_id: String) -> Promise {
+        set_panic_hook();
+        future_to_promise(async move {
+            match crate::rgb::proxy::get_media_metadata(&media_id).await {
+                Ok(result) => Ok(JsValue::from_string(
+                    serde_json::to_string(&result).unwrap(),
+                )),
+                Err(err) => Err(JsValue::from_string(err.to_string())),
+            }
+        })
+    }
+
+    #[wasm_bindgen]
+    pub fn import_consignments(request: JsValue) -> Promise {
+        set_panic_hook();
+        future_to_promise(async move {
+            let map: std::collections::BTreeMap<String, String> =
+                serde_wasm_bindgen::from_value(request).unwrap();
+            match crate::rgb::proxy::post_consignments(map, None).await {
+                Ok(()) => Ok(JsValue::from_string("true".to_string())),
+                Err(err) => Err(JsValue::from_string(err.to_string())),
+            }
+        })
+    }
+
+    #[wasm_bindgen]
+    pub fn create_psbt(_nostr_hex_sk: String, _request: JsValue) -> Promise {
+        rgb011_removed("create_psbt")
+    }
+
+    #[wasm_bindgen]
+    pub fn hidden_contract(_nostr_hex_sk: String, _contract_id: String) -> Promise {
+        rgb011_removed("hidden_contract")
+    }
+
+    #[wasm_bindgen]
+    pub fn list_interfaces(_nostr_hex_sk: String) -> Promise {
+        rgb011_removed("list_interfaces")
+    }
+
+    #[wasm_bindgen]
+    pub fn list_schemas(_nostr_hex_sk: String) -> Promise {
+        rgb011_removed("list_schemas")
+    }
+
+    #[wasm_bindgen]
+    pub fn watcher_details(_nostr_hex_sk: String, _name: String) -> Promise {
+        rgb011_removed("watcher_details")
+    }
+
+    #[wasm_bindgen]
+    pub fn watcher_address(_nostr_hex_sk: String, _name: String, _address: String) -> Promise {
+        rgb011_removed("watcher_address")
+    }
+
+    #[wasm_bindgen]
+    pub fn watcher_utxo(_nostr_hex_sk: String, _name: String, _utxo: String) -> Promise {
+        rgb011_removed("watcher_utxo")
+    }
+
+    #[wasm_bindgen]
+    pub fn remove_transfer(_nostr_hex_sk: String, _request: JsValue) -> Promise {
+        rgb011_removed("remove_transfer")
+    }
+
+    #[wasm_bindgen]
+    pub fn create_swap(_nostr_hex_sk: String, _request: JsValue) -> Promise {
+        rgb011_removed("create_swap")
+    }
+
+    #[wasm_bindgen]
+    pub fn create_auction_offers(_nostr_hex_sk: String, _request: JsValue) -> Promise {
+        rgb011_removed("create_auction_offers")
+    }
+
+    #[wasm_bindgen]
+    pub fn create_auction_bid(_nostr_hex_sk: String, _request: JsValue) -> Promise {
+        rgb011_removed("create_auction_bid")
+    }
+
+    #[wasm_bindgen]
+    pub fn finish_auction_offers(_nostr_hex_sk: String, _request: JsValue) -> Promise {
+        rgb011_removed("finish_auction_offers")
+    }
+
+    #[wasm_bindgen]
+    pub fn list_auctions() -> Promise {
+        rgb011_removed("list_auctions")
+    }
+
+    #[wasm_bindgen]
+    pub fn direct_swap(_nostr_hex_sk: String, _request: JsValue) -> Promise {
+        rgb011_removed("direct_swap")
+    }
+
+    #[wasm_bindgen]
+    pub fn import_uda_data(_request: JsValue) -> Promise {
+        rgb011_removed("import_uda_data")
     }
 
     #[wasm_bindgen]
@@ -1507,6 +1717,39 @@ pub mod utils {
     pub fn parse_contract_amount_precision(amount: String, precision: u8) -> String {
         set_panic_hook();
         ContractAmount::parse(amount, precision).to_string()
+    }
+
+    /// TypeScript `BMC.contract_amount`.
+    #[wasm_bindgen]
+    pub fn contract_amount(amount: u64, precision: u8) -> String {
+        set_panic_hook();
+        ContractAmount::with(amount, precision)
+            .to_value()
+            .to_string()
+    }
+
+    /// TypeScript `BMC.contract_amount_str`.
+    #[wasm_bindgen]
+    pub fn contract_amount_str(amount: u64, precision: u8) -> String {
+        convert_contract_amount_string(amount, precision)
+    }
+
+    /// TypeScript `BMC.contract_amount_parse_str`.
+    #[wasm_bindgen]
+    pub fn contract_amount_parse_str(amount: String, precision: u8) -> String {
+        parse_contract_amount_precision(amount, precision)
+    }
+
+    /// TypeScript `BMC.contract_amount_parse_value`.
+    #[wasm_bindgen]
+    pub fn contract_amount_parse_value(amount: String, precision: u8) -> String {
+        convert_contract_amount_raw(amount, precision)
+    }
+
+    /// TypeScript `BMC.contract_amount_parse_decimal_value`.
+    #[wasm_bindgen]
+    pub fn contract_amount_parse_decimal_value(amount: String) -> JsValue {
+        parse_contract_amount(amount)
     }
 
     #[wasm_bindgen]

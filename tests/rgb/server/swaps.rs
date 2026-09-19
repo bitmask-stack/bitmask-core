@@ -8,12 +8,14 @@ use bitmask_core::regtest::new_block;
 use bitmask_core::rgb::models::{ContractAmount, ContractInfo, ContractKit};
 use bitmask_core::rgb::swap::{BidOptions, OfferOptions, RgbSwap};
 use bitmask_core::rgb::{
-    bids, create_bid, create_offer, get_contract, public_offers, verify_transfers,
+    bid_swap_suppl, bids, create_bid, create_offer, get_contract, public_offers, verify_transfers,
 };
 use bitmask_core::structs::{
     ChainFee, ContractCounterParty, ContractResponse, ContractValue, OrderValue, PrivateWalletData,
     PublicWalletData, RgbBidRequest, RgbOfferItem, RgbOfferRequest, SecretString, UDAValue,
 };
+use bpstd::Psbt;
+use bpwallet::SighashType;
 use rgb::ContractId;
 
 #[derive(Clone, PartialEq)]
@@ -198,6 +200,12 @@ async fn create_swap_fungible_bitcoin() -> anyhow::Result<()> {
 
     let options = BidOptions::p2p(secrets);
     let new_bid = create_bid(&owner_sk.to_string(), req, options).await?;
+
+    let suppl = bid_swap_suppl(&owner_sk.to_string(), &new_bid.id).await?;
+    let psbt = Psbt::from_base64(&suppl.expect("swap suppl").psbt).expect("psbt");
+    for input in psbt.inputs() {
+        assert_eq!(input.sighash_type, Some(SighashType::none_anyone_can_pay()));
+    }
 
     let my_bids = bids(&owner_sk.to_string()).await?;
     assert!(my_bids.iter().any(|x| x.id == new_bid.id));
