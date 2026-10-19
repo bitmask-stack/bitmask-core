@@ -45,6 +45,27 @@ export const fullTransferAsset = async (
 ): Promise<RgbTransferResponse> =>
   JSON.parse(await BMC.full_transfer_asset(nostrHexSk, request));
 
+export const createAirdrop = async (
+  nostrHexSk: string,
+  request: RgbTransferRequest[] | RgbAirdropRequest,
+  secrets: string[],
+  fee: bigint,
+  maxClaim: string
+): Promise<RgbTransferResponse[]> =>
+  JSON.parse(await BMC.create_airdrop(nostrHexSk, request, secrets, fee, maxClaim));
+
+export const createAirdropClaim = async (
+  nostrHexSk: string,
+  request: RgbTransferRequest
+): Promise<RgbTransferResponse> =>
+  JSON.parse(await BMC.create_airdrop_claim(nostrHexSk, request));
+
+export const closeAirdrop = async (
+  nostrHexSk: string,
+  request: unknown
+): Promise<RgbAirdropCloseResponse> =>
+  JSON.parse(await BMC.close_airdrop(nostrHexSk, request));
+
 export const importContract = async (
   nostrHexSk: string,
   request: ImportRequest
@@ -546,6 +567,17 @@ export interface RgbTransferRequest {
   terminal: string;
 }
 
+export interface RgbAirdropRequest {
+  transfers: RgbTransferRequest[];
+  maxClaim?: string;
+}
+
+export interface RgbAirdropCloseResponse {
+  closed: boolean;
+  bundle?: string;
+  request?: unknown;
+}
+
 export interface FullRgbTransferRequest {
   /// The contract id
   contractId: string;
@@ -823,6 +855,7 @@ export enum RgbSwapStrategy {
   Auction = "auction",
   P2P = "p2p",
   HotSwap = "hotswap",
+  Airdrop = "airdrop",
 }
 
 export interface RgbAuctionStrategy {

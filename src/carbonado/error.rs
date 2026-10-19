@@ -33,6 +33,8 @@ pub enum CarbonadoError {
     WrongNostrPublicKey,
     /// Auction bundle id must be one path segment (no slash or `..`)
     InvalidAuctionBundleId,
+    /// Auction bundle is closed; offers cannot be stored
+    AuctionBundleClosed,
     /// Debug: {0}
     Debug(String),
     /// Error: {0}

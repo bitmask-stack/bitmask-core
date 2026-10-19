@@ -439,7 +439,7 @@ mod client {
             ContractMediaItem, MediaEncode, MediaExtractRequest, MediaMetadata,
             RgbProxyConsigFileReq, RgbProxyConsigRes, RgbProxyConsigUploadRes, RgbProxyMediaRes,
         },
-        util::{get, post_json},
+        util::post_json,
     };
     use serde_json::json;
 

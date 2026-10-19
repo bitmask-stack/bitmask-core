@@ -76,7 +76,7 @@ impl ResolveWitness for BitmaskResolver {
         witness_id: rgbcore::Txid,
     ) -> Result<WitnessStatus, WitnessResolverError> {
         let bp_id = crate::rgb::compat::txid_bitcoin_to_bp(witness_id);
-        if self.witnesses.get(&bp_id).is_none() {
+        if !self.witnesses.contains_key(&bp_id) {
             return Ok(WitnessStatus::Unresolved);
         };
 

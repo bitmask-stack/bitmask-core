@@ -9,7 +9,7 @@ use axum::{
     extract::{DefaultBodyLimit, Path},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use axum_extra::{
     TypedHeader,
@@ -31,7 +31,7 @@ use tower_http::cors::CorsLayer;
 
 use bitmask_core::{
     carbonado::metrics,
-    constants::{BMC_VERSION, get_network, switch_network},
+    constants::{BMC_VERSION, get_coordinator_nostr_key, get_network, switch_network},
 };
 use bitmask_core::{
     proxy::{
@@ -48,14 +48,15 @@ use bitmask_core::{
 use bitmask_core::rgb::issue::IssueContractOptions;
 
 use bitmask_core::carbonado::{
-    FileMetadata, auctions_retrieve, auctions_store, handle_file, marketplace_retrieve,
-    marketplace_store,
+    FileMetadata, auctions_close, auctions_retrieve, auctions_store, handle_file,
+    marketplace_retrieve, marketplace_store,
 };
 use bitmask_core::rgb::transfer::{RgbAcceptOptions, RgbInvoiceOptions, RgbTransferOptions};
 use bitmask_core::rgb::{
     accept_transfer, create_invoice, get_contract, import_contract, issue_contract, list_contracts,
     transfer_contract,
 };
+use bitmask_core::rgb::{clean_public_offers, reset_public_offers};
 use bitmask_core::structs::{
     AcceptRequest, IssueRequest, RgbInvoiceRequest, RgbTransferRequest, WatcherRequest,
 };
@@ -628,6 +629,73 @@ async fn rgb_store_swap(
 }
 */
 
+async fn rgb_close_auction(
+    TypedHeader(auth): TypedHeader<Authorization<Bearer>>,
+    Path(bundle_id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    info!("PUT /auction/{bundle_id}/close");
+
+    let coord_request_key = auth.token();
+    let coord_server_key = get_coordinator_nostr_key().await;
+    if coord_request_key != coord_server_key {
+        return Ok(StatusCode::UNAUTHORIZED);
+    }
+
+    match auctions_close(&bundle_id).await {
+        Ok(_) => Ok(StatusCode::OK),
+        Err(err) => {
+            error!("error in PUT /auction/{bundle_id}/close: {err}");
+            Err(err.into())
+        }
+    }
+}
+
+async fn coordinator_next_address() -> Result<impl IntoResponse, AppError> {
+    info!("GET /coordinator/address");
+    let resp = bitmask_core::rgb::coordinator::coordinator_next_address().await?;
+    Ok((StatusCode::OK, Json(resp)))
+}
+
+async fn coordinator_reset_offers(
+    TypedHeader(auth): TypedHeader<Authorization<Bearer>>,
+) -> Result<impl IntoResponse, AppError> {
+    info!("GET /coordinator/reset");
+
+    let coord_request_key = auth.token();
+    let coord_server_key = get_coordinator_nostr_key().await;
+    if coord_request_key != coord_server_key {
+        return Ok(StatusCode::UNAUTHORIZED);
+    }
+
+    match reset_public_offers().await {
+        Ok(_) => Ok(StatusCode::OK),
+        Err(err) => {
+            error!("error in GET /coordinator/reset: {err}");
+            Err(err.into())
+        }
+    }
+}
+
+async fn coordinator_clean_offers(
+    TypedHeader(auth): TypedHeader<Authorization<Bearer>>,
+) -> Result<impl IntoResponse, AppError> {
+    info!("GET /coordinator/clean");
+
+    let coord_request_key = auth.token();
+    let coord_server_key = get_coordinator_nostr_key().await;
+    if coord_request_key != coord_server_key {
+        return Ok(StatusCode::UNAUTHORIZED);
+    }
+
+    match clean_public_offers().await {
+        Ok(_) => Ok(StatusCode::OK),
+        Err(err) => {
+            error!("error in GET /coordinator/clean: {err}");
+            Err(err.into())
+        }
+    }
+}
+
 async fn rgb_retrieve_auction(
     Path((bundle_id, name)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -846,11 +914,15 @@ async fn main() -> Result<()> {
         // .route("/transfers/check", get(check_transfer))
         // .route("/swap/:name", get(rgb_retrieve_swap))
         // .route("/swap/:name", post(rgb_store_swap))
+        .route("/auction/:bundle_id/close", put(rgb_close_auction))
         .route("/auction/:bundle_id/:name", get(rgb_retrieve_auction))
         .route(
             "/auction/:bundle_id/:metadata/:name",
             post(rgb_store_auction),
         )
+        .route("/coordinator/address", get(coordinator_next_address))
+        .route("/coordinator/reset", get(coordinator_reset_offers))
+        .route("/coordinator/clean", get(coordinator_clean_offers))
         .route("/carbonado/status", get(status))
         .route("/carbonado/server/:name", get(co_server_retrieve))
         .route("/carbonado/server/:metadata/:name", post(co_server_store))

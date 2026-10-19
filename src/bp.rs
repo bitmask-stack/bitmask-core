@@ -517,7 +517,7 @@ pub async fn transfer_btc(
 pub async fn btc_backup(sk: &str) -> Result<bool, WatcherError> {
     watcher_prefetch(sk, "bitcoin").await?;
 
-    let network =
+    let _network =
         bp_network_from_str(&get_network().await).map_err(|_| WatcherError::WrongNetwork)?;
 
     let mut rgb_account_provider =
@@ -536,7 +536,7 @@ pub async fn btc_backup(sk: &str) -> Result<bool, WatcherError> {
 
 #[cfg(target_arch = "wasm32")]
 pub async fn btc_restore(sk: &str) -> Result<bool, WatcherError> {
-    let network =
+    let _network =
         bp_network_from_str(&get_network().await).map_err(|_| WatcherError::WrongNetwork)?;
 
     let mut rgb_account_provider =

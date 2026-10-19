@@ -732,9 +732,8 @@ pub async fn drain_wallet(
 
     debug!("Signing PSBT...");
     let finalized = wallet
-        .lock()
+        .sign_psbt(&mut psbt, SignOptions::default())
         .await
-        .sign(&mut psbt, SignOptions::default())
         .map_err(|e| BitcoinError::BdkSignError(e.to_string()))?;
 
     if !finalized {
@@ -817,9 +816,8 @@ pub async fn bump_fee(
     };
 
     let _finalized = wallet
-        .lock()
+        .sign_psbt(&mut psbt, SignOptions::default())
         .await
-        .sign(&mut psbt, SignOptions::default())
         .map_err(|e| BitcoinError::BdkSignError(e.to_string()))?;
     let fee_sats = psbt.fee().ok().map(|a| a.to_sat());
     let tx = psbt

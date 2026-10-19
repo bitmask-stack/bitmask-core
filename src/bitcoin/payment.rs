@@ -1,4 +1,4 @@
-use bdk_wallet::bitcoin::{Amount, FeeRate, psbt::Psbt};
+use bdk_wallet::bitcoin::{Amount, FeeRate, Sequence, psbt::Psbt};
 use bdk_wallet::bitcoin::{TxIn, psbt::Input};
 
 use payjoin::PjUri;
@@ -54,6 +54,7 @@ pub async fn create_transaction(
             );
         }
 
+        builder.set_exact_sequence(Sequence::ENABLE_RBF_NO_LOCKTIME);
         builder.fee_rate(fee_rate.unwrap_or_else(|| fee_rate_from_sat_vb(1.0)));
         builder
             .finish()

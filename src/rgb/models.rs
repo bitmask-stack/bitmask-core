@@ -1350,6 +1350,25 @@ impl RgbOrderbooks {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Cancel every open public offer. Filled offers stay.
+    pub fn reset_open_offers(&mut self) {
+        for offers in self.offers.values_mut() {
+            for offer in offers.iter_mut() {
+                if offer.is_open() {
+                    offer.cancel();
+                }
+            }
+        }
+    }
+
+    /// Drop filled public offers. Open offers stay.
+    pub fn clean_fill_offers(&mut self) {
+        for offers in self.offers.values_mut() {
+            offers.retain(|offer| !offer.is_fill());
+        }
+        self.offers.retain(|_, offers| !offers.is_empty());
+    }
 }
 
 #[derive(Clone, Getters, Serialize, Deserialize, Debug)]

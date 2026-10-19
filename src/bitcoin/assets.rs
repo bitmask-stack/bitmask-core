@@ -29,6 +29,8 @@ pub fn dust_tx(
     );
     let mut dust_psbt = tx_builder.finish()?;
 
+    // dust_tx only has Wallet. Wallet::sign is deprecated in bdk_wallet 3.2.0.
+    #[allow(deprecated)]
     let finalized = btc_wallet.sign(&mut dust_psbt, SignOptions::default())?;
     debug!(format!("PSBT signed. Finalized: {finalized}"));
     btc_wallet.finalize_psbt(&mut dust_psbt, SignOptions::default())?;

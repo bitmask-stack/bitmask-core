@@ -489,8 +489,10 @@ mod client {
                     Network::Testnet3 => ChainNet::BitcoinTestnet3,
                     Network::Testnet4 => ChainNet::BitcoinTestnet4,
                 };
-                let mut info = RgbAccountInfo::default();
-                info.chain_net = chain_net;
+                let info = RgbAccountInfo {
+                    chain_net,
+                    ..RgbAccountInfo::default()
+                };
                 crate::debug!(format!(
                     "rgb_account.load.fallback_to_default pending_hosts_count={} lookahead_hints_count={} commits_count={}",
                     info.pending_hosts.len(),
@@ -734,6 +736,7 @@ mod client {
             Ok(())
         }
 
+        #[allow(dead_code)]
         async fn server_get(
             self,
             keys: Vec<&str>,
@@ -754,6 +757,7 @@ mod client {
             Ok(result)
         }
 
+        #[allow(dead_code)]
         async fn server_set(self, kv: BTreeMap<String, String>) -> Result<(), CrossStoreError> {
             let sk = self.access.sk();
             for (key, data) in kv {

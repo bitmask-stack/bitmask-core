@@ -3,7 +3,10 @@ use std::{collections::BTreeMap, sync::Arc};
 use bdk_esplora::EsploraAsyncExt;
 use bdk_esplora::esplora_client::{AsyncClient, Builder as EsploraBuilder};
 use bdk_wallet::bitcoin::Network;
-use bdk_wallet::{KeychainKind, Wallet};
+use bdk_wallet::bitcoin::psbt::Psbt;
+use bdk_wallet::descriptor::IntoWalletDescriptor;
+use bdk_wallet::signer::{SignerError, SignersContainer};
+use bdk_wallet::{KeychainKind, SignOptions, Wallet};
 use bitcoin::hashes::{Hash, sha256};
 use futures::Future;
 use once_cell::sync::Lazy;
@@ -59,7 +62,47 @@ pub enum BitcoinWalletError {
     BuildEsploraError(String),
 }
 
-pub type MemoryWallet = Arc<Mutex<Wallet>>;
+/// In-memory BDK wallet plus caller-owned signers (bdk_wallet 3.2.0).
+/// `Wallet::sign` is deprecated; keep the keymap here for `sign_with_signers`.
+#[derive(Clone)]
+pub struct MemoryWallet {
+    wallet: Arc<Mutex<Wallet>>,
+    signers: Arc<Vec<SignersContainer>>,
+}
+
+impl MemoryWallet {
+    pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, Wallet> {
+        self.wallet.lock().await
+    }
+
+    pub async fn sign_psbt(
+        &self,
+        psbt: &mut Psbt,
+        sign_options: SignOptions,
+    ) -> Result<bool, SignerError> {
+        let locked = self.wallet.lock().await;
+        let refs: Vec<&SignersContainer> = self.signers.iter().collect();
+        locked.sign_with_signers(psbt, &refs, sign_options)
+    }
+}
+
+fn signers_from_descriptors(
+    wallet: &Wallet,
+    external: &str,
+    internal: Option<&str>,
+) -> Result<Vec<SignersContainer>, BitcoinWalletError> {
+    let secp = wallet.secp_ctx();
+    let network_kind = wallet.network().into();
+    let mut signers = Vec::with_capacity(2);
+    let (desc, keymap) = external.into_wallet_descriptor(secp, network_kind)?;
+    signers.push(SignersContainer::build(keymap, &desc, secp));
+    if let Some(internal) = internal {
+        let (desc, keymap) = internal.into_wallet_descriptor(secp, network_kind)?;
+        signers.push(SignersContainer::build(keymap, &desc, secp));
+    }
+    Ok(signers)
+}
+
 type Wallets = BTreeMap<(String, Option<String>), MemoryWallet>;
 type NetworkWallet = Arc<RwLock<Wallets>>;
 
@@ -121,15 +164,23 @@ pub async fn get_wallet(
     let created = match change_descriptor {
         Some(change) => {
             let internal = change.0.clone();
-            Wallet::create(external, internal)
+            Wallet::create(external.clone(), internal)
                 .network(network)
                 .create_wallet_no_persist()?
         }
-        None => Wallet::create_single(external)
+        None => Wallet::create_single(external.clone())
             .network(network)
             .create_wallet_no_persist()?,
     };
-    let new_wallet = Arc::new(Mutex::new(created));
+    let signers = signers_from_descriptors(
+        &created,
+        &external,
+        change_descriptor.map(|change| change.0.as_str()),
+    )?;
+    let new_wallet = MemoryWallet {
+        wallet: Arc::new(Mutex::new(created)),
+        signers: Arc::new(signers),
+    };
 
     let key_outer = key;
     let new_wallet_outer = new_wallet.clone();

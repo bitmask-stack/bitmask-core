@@ -1,7 +1,7 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use crate::bp::server::seeder::{WalletSeed, create_new_wallet};
-use bitmask_core::bitcoin::{BitcoinError, bump_fee, drain_wallet, get_wallet_data, send_sats};
+use bitmask_core::bitcoin::{bump_fee, drain_wallet, get_wallet_data, send_sats};
 use bitmask_core::bp::{FundOptions, fund_vault, transfer_btc};
 use bitmask_core::regtest::new_block;
 use bitmask_core::structs::{
@@ -116,10 +116,7 @@ async fn send_sats_then_bump_fee() -> anyhow::Result<()> {
         Ok(bumped) => {
             assert_ne!(bumped.details.txid, send.details.txid);
         }
-        Err(BitcoinError::BdkFeeBumpError(_)) => {
-            // HEAD: create_transaction never calls enable_rbf.
-        }
-        Err(e) => panic!("unexpected bump_fee error: {e}"),
+        Err(e) => panic!("bump_fee failed: {e}"),
     }
     Ok(())
 }

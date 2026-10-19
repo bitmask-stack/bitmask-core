@@ -610,6 +610,7 @@ mod client {
             Ok(())
         }
 
+        #[allow(dead_code)]
         async fn server_get(
             self,
             keys: Vec<&str>,
@@ -627,6 +628,7 @@ mod client {
             Ok(result)
         }
 
+        #[allow(dead_code)]
         async fn server_set(self, kv: BTreeMap<String, String>) -> Result<(), CrossStoreError> {
             let sk = self.access.sk();
             for (key, data) in kv {

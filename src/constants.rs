@@ -121,6 +121,21 @@ pub async fn get_coordinator_nostr_key() -> String {
     COORDINATOR_NOSTR.read().await.to_string()
 }
 
+pub async fn get_coordinator_xpub() -> String {
+    COORDINATOR_XPUB.read().await.to_string()
+}
+
+/// Coordinator config errors. Empty `COORDINATOR_XPUB` must not panic.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CoordinatorError {
+    /// COORDINATOR_XPUB is empty
+    #[error("COORDINATOR_XPUB is empty")]
+    EmptyXpub,
+    /// COORDINATOR_XPUB is invalid: {0}
+    #[error("COORDINATOR_XPUB is invalid: {0}")]
+    InvalidXpub(String),
+}
+
 /// Normalize an operator network name. `testnet` means testnet3.
 /// Generic signet is not a product network; mutinynet is the supported signet.
 /// `regtest` still parses for leftover docker env init; `switch_network` rejects it.

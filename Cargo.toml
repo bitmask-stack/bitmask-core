@@ -10,7 +10,7 @@ authors = [
 ]
 description = "Core functionality for the BitMask wallet"
 edition = "2024"
-rust-version = "1.98"
+rust-version = "1.99"
 license = "MIT"
 homepage = "https://bitmask.app"
 repository = "https://github.com/bitmask-stack/bitmask-core"
@@ -65,7 +65,7 @@ bp-dbc = { version = "=0.11.1-alpha.2", features = ["serde"] }
 # No v1 ECIES reader. Do not take bitmask-next's crates.io carbonado 0.4.2.
 # See [crates.io carbonado 0.7.0](https://crates.io/crates/carbonado/0.7.0)
 # (accessed: 2026-08-27).
-carbonado = { version = "0.7.0", default-features = false, features = ["backend-rust"] }
+carbonado = { version = "=0.7.0", default-features = false, features = ["backend-rust"] }
 # Product uses to_allocvec / from_bytes. Default heapless-cas pulls heapless 0.7
 # and atomic-polyfill ([RUSTSEC-2023-0089](https://rustsec.org/advisories/RUSTSEC-2023-0089),
 # accessed: 2026-08-26).
@@ -108,8 +108,8 @@ payjoin = { version = "1.0.0", default-features = false, features = ["v1"] }
 rand = "0.8"
 
 # RGB Protocol 0.11.1-rc.11 (github.com/rgb-protocol, docs.rgb.info; accessed: 2026-08-26).
-# Not RGB-WG 0.12. Companions: rgb-strict-encoding / rgb-strict-types / rgb-ascii-armor 1.0.2,
-# rgb-aluvm 0.11.1-rc.4 (same day as RC11).
+# Not RGB-WG 0.12. Companions: rgb-strict-encoding / rgb-strict-types / rgb-ascii-armor 1.0.4,
+# rgb-aluvm 0.11.1 (lock after 1.99 cargo update; protocol crates stay 0.11.1-rc.11).
 strict_types = { package = "rgb-strict-types", version = "1.0.2" }
 strict_encoding = { package = "rgb-strict-encoding", version = "1.0.2" }
 rgb-ops = { version = "=0.11.1-rc.11", features = ["serde"] }

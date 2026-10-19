@@ -89,9 +89,8 @@ fn details_from_broadcast_tx(
 pub async fn sign_psbt(wallet: &MemoryWallet, mut psbt: Psbt) -> Result<Psbt, BitcoinPsbtError> {
     debug!("Funding PSBT...");
     wallet
-        .lock()
+        .sign_psbt(&mut psbt, sign_opts())
         .await
-        .sign(&mut psbt, sign_opts())
         .map_err(|e| BitcoinPsbtError::BdkSignError(e.to_string()))?;
     Ok(psbt)
 }
@@ -107,9 +106,9 @@ pub async fn multi_sign_psbt(
 
     let mut sign_count = 0;
     for wallet in wallets {
-        let current_wallet = wallet.lock().await;
-        let sign = current_wallet
-            .sign(&mut psbt, sign_opts())
+        let sign = wallet
+            .sign_psbt(&mut psbt, sign_opts())
+            .await
             .map_err(|e| BitcoinPsbtError::BdkSignError(e.to_string()))?;
 
         if sign {
@@ -148,9 +147,8 @@ pub async fn sign_and_publish_psbt(
 ) -> Result<TransactionDetails, BitcoinPsbtError> {
     info!("Signing PSBT...");
     let finalized = wallet
-        .lock()
+        .sign_psbt(&mut psbt, SignOptions::default())
         .await
-        .sign(&mut psbt, SignOptions::default())
         .map_err(|e| BitcoinPsbtError::BdkSignError(e.to_string()))?;
     info!(format!("Finalized: {finalized}"));
     if finalized {
@@ -190,9 +188,8 @@ pub async fn multi_sign_and_publish_psbt(
     let mut finalized = false;
     for wallet in wallets {
         finalized = wallet
-            .lock()
+            .sign_psbt(&mut psbt, sign_opts())
             .await
-            .sign(&mut psbt, sign_opts())
             .map_err(|e| BitcoinPsbtError::BdkSignError(e.to_string()))?;
 
         sign_count += 1;

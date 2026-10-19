@@ -282,6 +282,88 @@ pub async fn save_public_offers(offers: Vec<PublicRgbOffer>) -> Result<(), Serve
     Ok(())
 }
 
+/// Cancel every open marketplace offer. Filled offers stay.
+pub async fn reset_public_offers() -> Result<(), ServerErrors> {
+    let name = MARKETPLACE_OFFERS;
+    let hashed_name = blake3::hash(format!("{LIB_ID_RGB}-{name}").as_bytes())
+        .to_hex()
+        .to_ascii_lowercase();
+
+    let main_name = &format!("{hashed_name}.c15");
+    let (data, _) = marketplace_retrieve(main_name)
+        .await
+        .map_err(|op| ServerErrors::CarbonadoRetrieve(name.to_string(), op.to_string()))?;
+
+    if data.is_empty() {
+        return Ok(());
+    }
+
+    let data: String =
+        from_bytes(&data).map_err(|op| ServerErrors::Decode(name.to_string(), op.to_string()))?;
+
+    let mut orderbooks: RgbOrderbooks = serde_json::from_str(&data)
+        .map_err(|op| ServerErrors::Decode(name.to_string(), op.to_string()))?;
+
+    orderbooks.reset_open_offers();
+
+    let content = serde_json::to_string(&orderbooks)
+        .map_err(|op| ServerErrors::Encode(name.to_string(), op.to_string()))?;
+
+    let data = to_allocvec(&content)
+        .map_err(|op| ServerErrors::Encode(name.to_string(), op.to_string()))?;
+
+    marketplace_store(
+        &format!("{hashed_name}.c15"),
+        &data,
+        Some(RGB_DATA_VERSION.to_vec()),
+    )
+    .await
+    .map_err(|op| ServerErrors::CarbonadoWrite(name.to_string(), op.to_string()))?;
+
+    Ok(())
+}
+
+/// Remove filled marketplace offers.
+pub async fn clean_public_offers() -> Result<(), ServerErrors> {
+    let name = MARKETPLACE_OFFERS;
+    let hashed_name = blake3::hash(format!("{LIB_ID_RGB}-{name}").as_bytes())
+        .to_hex()
+        .to_ascii_lowercase();
+
+    let main_name = &format!("{hashed_name}.c15");
+    let (data, _) = marketplace_retrieve(main_name)
+        .await
+        .map_err(|op| ServerErrors::CarbonadoRetrieve(name.to_string(), op.to_string()))?;
+
+    if data.is_empty() {
+        return Ok(());
+    }
+
+    let data: String =
+        from_bytes(&data).map_err(|op| ServerErrors::Decode(name.to_string(), op.to_string()))?;
+
+    let mut orderbooks: RgbOrderbooks = serde_json::from_str(&data)
+        .map_err(|op| ServerErrors::Decode(name.to_string(), op.to_string()))?;
+
+    orderbooks.clean_fill_offers();
+
+    let content = serde_json::to_string(&orderbooks)
+        .map_err(|op| ServerErrors::Encode(name.to_string(), op.to_string()))?;
+
+    let data = to_allocvec(&content)
+        .map_err(|op| ServerErrors::Encode(name.to_string(), op.to_string()))?;
+
+    marketplace_store(
+        &format!("{hashed_name}.c15"),
+        &data,
+        Some(RGB_DATA_VERSION.to_vec()),
+    )
+    .await
+    .map_err(|op| ServerErrors::CarbonadoWrite(name.to_string(), op.to_string()))?;
+
+    Ok(())
+}
+
 pub async fn match_public_offer(mut public_bid: PublicRgbBid) -> Result<(), ServerErrors> {
     let name = MARKETPLACE_OFFERS;
     let hashed_name = blake3::hash(format!("{LIB_ID_RGB}-{name}").as_bytes())

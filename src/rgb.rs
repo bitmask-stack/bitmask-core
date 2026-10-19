@@ -9,6 +9,7 @@ pub mod models;
 pub mod prefetch;
 pub mod proxy;
 use bpstd::Vout;
+pub mod coordinator;
 pub mod ext;
 mod server;
 pub(crate) mod store;
@@ -52,6 +53,7 @@ use crate::rgb::proxy::{
 use crate::rgb::server::{
     backup_rgb_account, backup_rgb_stock, restore_rgb_account, restore_rgb_stock,
 };
+pub use crate::rgb::server::{clean_public_offers, reset_public_offers};
 use crate::rgb::server::{
     get_public_offer, list_fill_public_offers, list_public_offers, match_public_offer,
     remove_public_bid, remove_public_offer, save_public_offers,
@@ -4661,7 +4663,7 @@ pub fn get_rgb_version() -> String {
 pub async fn rgb_backup(sk: &str) -> Result<bool, WatcherError> {
     watcher_prefetch(sk, "rgb").await?;
 
-    let network =
+    let _network =
         bp_network_from_str(&get_network().await).map_err(|_| WatcherError::WrongNetwork)?;
 
     let mut rgb_stock_provider =
@@ -4694,7 +4696,7 @@ pub async fn rgb_backup(sk: &str) -> Result<bool, WatcherError> {
 
 #[cfg(target_arch = "wasm32")]
 pub async fn rgb_restore(sk: &str) -> Result<bool, WatcherError> {
-    let network =
+    let _network =
         bp_network_from_str(&get_network().await).map_err(|_| WatcherError::WrongNetwork)?;
 
     let mut rgb_stock_provider =

@@ -1,8 +1,5 @@
-#![allow(warnings)]
 #![allow(clippy::unwrap_used, clippy::expect_used)] // This is just an API, not business logic, so errors here aren't as impactful
 
-use crate::rgb::swap::{BidOptions, OfferOptions};
-use crate::structs::{RgbBidRequest, RgbOfferRequest};
 use js_sys::Promise;
 use serde::de::DeserializeOwned;
 use wasm_bindgen::prelude::*;
@@ -724,16 +721,17 @@ pub mod rgb {
     use crate::rgb::swap::{BidOptions, OfferOptions};
     use crate::rgb::transfer::{RgbAcceptOptions, RgbInvoiceOptions, RgbTransferOptions};
     use crate::structs::{
-        AcceptRequest, IssueRequest, RgbBidRequest, RgbCancelBidsRequest, RgbCancelOffersRequest,
-        RgbInvoiceRequest, RgbOfferRequest, RgbTransferRequest, SaveTransferRequest,
-        WatcherRequest,
+        AcceptRequest, ChainFee, IssueRequest, RgbBidRequest, RgbCancelBidsRequest,
+        RgbCancelOffersRequest, RgbInvoiceRequest, RgbInvoiceValue, RgbOfferRequest,
+        RgbTransferRequest, RgbTransferResponse, SaveTransferRequest,
     };
+    use serde::Deserialize;
     use wasm_bindgen::prelude::wasm_bindgen;
 
     fn remap_issue_request(request: JsValue) -> JsValue {
         let mut v: serde_json::Value =
             serde_wasm_bindgen::from_value(request).unwrap_or(serde_json::Value::Null);
-        if let serde_json::Value::Object(ref mut map) = v
+        if let serde_json::Value::Object(map) = &mut v
             && let Some(supply) = map.get("supply")
             && !supply.is_string()
         {
@@ -749,7 +747,12 @@ pub mod rgb {
     fn remap_full_transfer_request(request: JsValue) -> JsValue {
         let mut v: serde_json::Value =
             serde_wasm_bindgen::from_value(request).unwrap_or(serde_json::Value::Null);
-        if let serde_json::Value::Object(ref mut map) = v {
+        remap_transfer_json(&mut v);
+        serde_wasm_bindgen::to_value(&v).unwrap_or(JsValue::NULL)
+    }
+
+    fn remap_transfer_json(v: &mut serde_json::Value) {
+        if let serde_json::Value::Object(map) = v {
             if !map.contains_key("invoice")
                 && let Some(inv) = map.get("rgbInvoice").cloned()
             {
@@ -761,7 +764,120 @@ pub mod rgb {
                 map.insert("chainFee".into(), fee);
             }
         }
-        serde_wasm_bindgen::to_value(&v).unwrap_or(JsValue::NULL)
+    }
+
+    fn remap_airdrop_transfers_json(v: &mut serde_json::Value) {
+        match v {
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    remap_transfer_json(item);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                if let Some(serde_json::Value::Array(items)) = map.get_mut("transfers") {
+                    for item in items {
+                        remap_transfer_json(item);
+                    }
+                } else {
+                    if !map.contains_key("invoice")
+                        && let Some(inv) = map.get("rgbInvoice").cloned()
+                    {
+                        map.insert("invoice".into(), inv);
+                    }
+                    if !map.contains_key("chainFee")
+                        && let Some(fee) = map.get("fee").cloned()
+                    {
+                        map.insert("chainFee".into(), fee);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn js_typed_error(value: serde_json::Value) -> String {
+        serde_json::to_string(&value).unwrap_or_else(|_| r#"{"error":"encode"}"#.to_string())
+    }
+
+    fn decimal_units(s: &str) -> Option<(u128, u32)> {
+        let s = s.trim().replace(['_', ','], "");
+        if s.is_empty() {
+            return None;
+        }
+        let (int, frac) = match s.as_str().split_once('.') {
+            Some((i, f)) => (i, f.trim_end_matches('0')),
+            None => (s.as_str(), ""),
+        };
+        let int = int.trim_start_matches('+');
+        if int.is_empty() && frac.is_empty() {
+            return None;
+        }
+        if !int.chars().all(|c| c.is_ascii_digit()) || !frac.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        let digits = format!("{int}{frac}");
+        let digits = if digits.chars().all(|c| c == '0') {
+            "0".to_string()
+        } else {
+            digits.trim_start_matches('0').to_string()
+        };
+        let val = digits.parse::<u128>().ok()?;
+        Some((val, frac.len() as u32))
+    }
+
+    fn amount_exceeds_cap(amount: &str, cap: &str) -> Result<bool, ()> {
+        let (av, ap) = decimal_units(amount).ok_or(())?;
+        let (cv, cp) = decimal_units(cap).ok_or(())?;
+        let p = ap.max(cp);
+        let av = av.checked_mul(10u128.pow(p.saturating_sub(ap))).ok_or(())?;
+        let cv = cv.checked_mul(10u128.pow(p.saturating_sub(cp))).ok_or(())?;
+        Ok(av > cv)
+    }
+
+    fn invoice_value_amount(value: &RgbInvoiceValue) -> String {
+        match value {
+            RgbInvoiceValue::Value(v) => v.clone(),
+            RgbInvoiceValue::UDA(uda) => uda.fraction.to_string(),
+        }
+    }
+
+    fn apply_airdrop_fee(req: &mut RgbTransferRequest, fee: u64) {
+        match req.chain_fee {
+            ChainFee::None | ChainFee::Value(0) => {
+                req.chain_fee = ChainFee::Value(fee);
+            }
+            _ => {}
+        }
+    }
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum AirdropRequestBody {
+        List(Vec<RgbTransferRequest>),
+        Wrapped(AirdropTransfers),
+        One(RgbTransferRequest),
+    }
+
+    #[derive(Deserialize)]
+    struct AirdropTransfers {
+        transfers: Vec<RgbTransferRequest>,
+        #[serde(default, alias = "max_claim", rename = "maxClaim")]
+        max_claim: Option<String>,
+    }
+
+    fn parse_airdrop_transfers(
+        mut raw: serde_json::Value,
+    ) -> Result<(Vec<RgbTransferRequest>, Option<String>), String> {
+        remap_airdrop_transfers_json(&mut raw);
+        match serde_json::from_value::<AirdropRequestBody>(raw) {
+            Ok(AirdropRequestBody::List(transfers)) => Ok((transfers, None)),
+            Ok(AirdropRequestBody::Wrapped(body)) => Ok((body.transfers, body.max_claim)),
+            Ok(AirdropRequestBody::One(one)) => Ok((vec![one], None)),
+            Err(err) => Err(js_typed_error(serde_json::json!({
+                "error": "parse",
+                "message": format!("create_airdrop request must be transfers: {err}"),
+            }))),
+        }
     }
 
     fn rgb011_removed(name: &'static str) -> Promise {
@@ -792,8 +908,6 @@ pub mod rgb {
             }
         })
     }
-
-    use super::*;
 
     #[wasm_bindgen]
     pub fn get_contract(nostr_hex_sk: String, request: String) -> Promise {
@@ -866,8 +980,10 @@ pub mod rgb {
 
         future_to_promise(async move {
             let req: IssueRequest = serde_wasm_bindgen::from_value(request).unwrap();
-            let mut options = IssueContractOptions::default();
-            options.proxy = true;
+            let options = IssueContractOptions {
+                proxy: true,
+                ..IssueContractOptions::default()
+            };
 
             match crate::rgb::issue_contract(&nostr_hex_sk, req, options).await {
                 Ok(result) => Ok(JsValue::from_string(
@@ -1185,7 +1301,7 @@ pub mod rgb {
     }
 
     #[wasm_bindgen]
-    pub fn can_create_offer(nostr_hex_sk: String, request: JsValue, secrets: JsValue) -> Promise {
+    pub fn can_create_offer(nostr_hex_sk: String, request: JsValue, _secrets: JsValue) -> Promise {
         set_panic_hook();
 
         future_to_promise(async move {
@@ -1233,7 +1349,7 @@ pub mod rgb {
     }
 
     #[wasm_bindgen]
-    pub fn can_create_bid(nostr_hex_sk: String, request: JsValue, secrets: JsValue) -> Promise {
+    pub fn can_create_bid(nostr_hex_sk: String, request: JsValue, _secrets: JsValue) -> Promise {
         set_panic_hook();
 
         future_to_promise(async move {
@@ -1402,17 +1518,160 @@ pub mod rgb {
         fee: u64,
         max_claim: String,
     ) -> Promise {
-        todo!()
+        set_panic_hook();
+
+        future_to_promise(async move {
+            let raw: serde_json::Value =
+                serde_wasm_bindgen::from_value(request).unwrap_or(serde_json::Value::Null);
+            let (mut transfers, wrapped_cap) = match parse_airdrop_transfers(raw) {
+                Ok(parsed) => parsed,
+                Err(err) => return Err(JsValue::from_string(err)),
+            };
+            let secrets: Vec<SecretString> = match serde_wasm_bindgen::from_value(secrets) {
+                Ok(keys) => keys,
+                Err(err) => {
+                    return Err(JsValue::from_string(js_typed_error(serde_json::json!({
+                        "error": "parse",
+                        "message": format!("create_airdrop secrets: {err}"),
+                    }))));
+                }
+            };
+            let cap = if !max_claim.is_empty() {
+                max_claim
+            } else {
+                wrapped_cap.unwrap_or_default()
+            };
+
+            let mut responses: Vec<RgbTransferResponse> = Vec::new();
+            for req in transfers.iter_mut() {
+                apply_airdrop_fee(req, fee);
+
+                if !cap.is_empty() {
+                    let mut amount = match &req.sender_amount {
+                        Some(value) => invoice_value_amount(value),
+                        None => String::new(),
+                    };
+                    if (amount.is_empty() || amount == "0")
+                        && let Ok(decoded) = crate::rgb::decode_invoice(req.invoice.clone()).await
+                    {
+                        amount = invoice_value_amount(&decoded.amount);
+                    }
+                    match amount_exceeds_cap(&amount, &cap) {
+                        Ok(true) => {
+                            return Err(JsValue::from_string(js_typed_error(serde_json::json!({
+                                "error": "max_claim",
+                                "message": "transfer amount exceeds max_claim",
+                                "amount": amount,
+                                "maxClaim": cap,
+                                "invoice": req.invoice,
+                            }))));
+                        }
+                        Ok(false) => {}
+                        Err(()) => {
+                            return Err(JsValue::from_string(js_typed_error(serde_json::json!({
+                                "error": "max_claim",
+                                "message": "could not compare invoice or sender amount to max_claim",
+                                "amount": amount,
+                                "maxClaim": cap,
+                                "invoice": req.invoice,
+                            }))));
+                        }
+                    }
+                }
+
+                let options = RgbTransferOptions::broadcast(secrets.clone());
+                match crate::rgb::transfer_contract(&nostr_hex_sk, req.clone(), options).await {
+                    Ok(resp) => responses.push(resp),
+                    Err(err) => {
+                        return Err(JsValue::from_string(RgbError::Transfer(err).to_string()));
+                    }
+                }
+            }
+
+            Ok(JsValue::from_string(
+                serde_json::to_string(&responses).unwrap(),
+            ))
+        })
     }
 
     #[wasm_bindgen]
     pub fn create_airdrop_claim(nostr_hex_sk: String, request: JsValue) -> Promise {
-        todo!()
+        set_panic_hook();
+
+        future_to_promise(async move {
+            let mut raw: serde_json::Value =
+                serde_wasm_bindgen::from_value(request).unwrap_or(serde_json::Value::Null);
+            remap_transfer_json(&mut raw);
+            let secrets = raw
+                .as_object()
+                .and_then(|map| map.get("secrets"))
+                .cloned()
+                .and_then(|v| serde_json::from_value::<Vec<SecretString>>(v).ok());
+            if let Some(map) = raw.as_object_mut() {
+                map.remove("secrets");
+            }
+            let req: RgbTransferRequest = match serde_json::from_value(raw) {
+                Ok(req) => req,
+                Err(err) => {
+                    return Err(JsValue::from_string(js_typed_error(serde_json::json!({
+                        "error": "parse",
+                        "message": format!("create_airdrop_claim request: {err}"),
+                    }))));
+                }
+            };
+            let options = match secrets {
+                Some(keys) if !keys.is_empty() => RgbTransferOptions::broadcast(keys),
+                _ => RgbTransferOptions::default(),
+            };
+
+            match crate::rgb::transfer_contract(&nostr_hex_sk, req, options).await {
+                Ok(resp) => Ok(JsValue::from_string(serde_json::to_string(&resp).unwrap())),
+                Err(err) => Err(JsValue::from_string(RgbError::Transfer(err).to_string())),
+            }
+        })
     }
 
     #[wasm_bindgen]
     pub fn close_airdrop(nostr_hex_sk: String, request: JsValue) -> Promise {
-        todo!()
+        set_panic_hook();
+
+        future_to_promise(async move {
+            let _ = nostr_hex_sk;
+            let body: serde_json::Value = match serde_wasm_bindgen::from_value(request) {
+                Ok(value) => value,
+                Err(err) => {
+                    return Err(JsValue::from_string(js_typed_error(serde_json::json!({
+                        "error": "parse",
+                        "message": format!("close_airdrop request: {err}"),
+                    }))));
+                }
+            };
+            if body.is_null() {
+                return Err(JsValue::from_string(js_typed_error(serde_json::json!({
+                    "error": "parse",
+                    "message": "close_airdrop request is required",
+                }))));
+            }
+
+            let closed = match body {
+                serde_json::Value::Object(mut map) => {
+                    map.insert("closed".into(), serde_json::Value::Bool(true));
+                    serde_json::Value::Object(map)
+                }
+                serde_json::Value::String(bundle) => serde_json::json!({
+                    "closed": true,
+                    "bundle": bundle,
+                }),
+                other => serde_json::json!({
+                    "closed": true,
+                    "request": other,
+                }),
+            };
+
+            Ok(JsValue::from_string(
+                serde_json::to_string(&closed).unwrap(),
+            ))
+        })
     }
 
     #[wasm_bindgen]

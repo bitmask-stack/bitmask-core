@@ -3,9 +3,9 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    # Binary Rust 1.98.0. nixpkgs-unstable rustc lagged at 1.97.x.
-    # Manifest: https://github.com/oxalica/rust-overlay/blob/master/manifests/stable/1.98.0.nix
-    # (dated 2026-08-20; accessed: 2026-08-24).
+    # Binary Rust 1.99.0 via rust-overlay (fromRustupToolchainFile).
+    # Manifest: https://github.com/oxalica/rust-overlay/blob/master/manifests/stable/1.99.0.nix
+    # (dated 2026-10-01; accessed: 2026-10-09).
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -54,7 +54,7 @@
             overlays = [ rust-overlay.overlays.default ];
           };
 
-          # rust-toolchain.toml is the pin (channel 1.98.0 + clippy/rustfmt + wasm32).
+          # rust-toolchain.toml is the pin (channel 1.99.0 + clippy/rustfmt + wasm32).
           rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
           craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
@@ -79,7 +79,7 @@
             inherit src;
             outputHashes = gitOutputHashes;
             # Crane's git vendor runs `cargo package -l` on every Cargo.toml
-            # in remaining RGB git checkouts. cargo 1.98 treats Cargo.toml.orig
+            # in remaining RGB git checkouts. cargo 1.99 treats Cargo.toml.orig
             # as reserved. Keep this off commonArgs: mkCargoDerivation would
             # coerce it into a derivation env var.
             overrideVendorGitCheckout =
@@ -133,17 +133,17 @@
             }
           );
 
-          # Lock wasm-bindgen is 0.2.127. nixpkgs wasm-bindgen-cli is 0.2.121.
+          # Lock wasm-bindgen is 0.2.129. nixpkgs wasm-bindgen-cli is older.
           wasmBindgenCli = pkgs.buildWasmBindgenCli rec {
             src = pkgs.fetchCrate {
               pname = "wasm-bindgen-cli";
-              version = "0.2.127";
-              hash = "sha256-di+qBAdd7pENLiIB9CoZoab+W5xeDoByMREcCGTSzWo=";
+              version = "0.2.129";
+              hash = "sha256-pcecKQd7E8Opw6bkFoE569epUi7gh5qpQF1e5PJY6V8=";
             };
             cargoDeps = pkgs.rustPlatform.fetchCargoVendor {
               inherit src;
               inherit (src) pname version;
-              hash = "sha256-FTv2GZIAQs0ePdIZXIXil7JbZ6kIT05VG6vqC1qNFxQ=";
+              hash = "sha256-vmUrWVU7kPJJxO5qIVeAkwQyWDELO1Z4Z5gitz2kco8=";
             };
           };
 
@@ -262,7 +262,7 @@
               cargoArtifacts = wasmQualityArtifacts;
               pname = "bitmask-core-clippy-wasm-quality";
               cargoExtraArgs = "--locked --lib --target wasm32-unknown-unknown";
-              cargoClippyExtraArgs = "-- --deny warnings --allow unused --allow deprecated --allow clippy::all --allow async_fn_in_trait";
+              cargoClippyExtraArgs = "-- --deny warnings";
               CARGO_BUILD_TARGET = "wasm32-unknown-unknown";
             }
           )).overrideAttrs (old: {

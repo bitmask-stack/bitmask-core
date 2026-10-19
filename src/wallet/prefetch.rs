@@ -13,9 +13,9 @@ use bpwallet::{
     Layer2Empty, MiningInfo, Party, TxCredit, TxDebit, TxStatus, WalletAddr, WalletCache, WalletTx,
 };
 use esplora::{AsyncClient, Error};
-use nonasync::persistence::{
-    CloneNoPersistence, PersistenceError, PersistenceProvider, Persisting,
-};
+#[cfg(not(target_arch = "wasm32"))]
+use nonasync::persistence::PersistenceProvider;
+use nonasync::persistence::{CloneNoPersistence, PersistenceError, Persisting};
 use rgbcore::ChainNet;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;

@@ -9,8 +9,8 @@ pub mod metrics;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use server::{
-    auctions_retrieve, auctions_store, handle_file, local_store, marketplace_retrieve,
-    marketplace_store, retrieve, retrieve_metadata, store,
+    auctions_close, auctions_retrieve, auctions_store, handle_file, local_store,
+    marketplace_retrieve, marketplace_store, retrieve, retrieve_metadata, store,
 };
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -19,6 +19,9 @@ pub struct FileMetadata {
     pub filename: String,
     pub metadata: [u8; 8],
 }
+
+/// Carbonado object name for a closed auction-bundle marker.
+pub const AUCTION_CLOSED_NAME: &str = "closed";
 
 fn auction_path_segment(part: &str) -> Result<(), CarbonadoError> {
     if part.is_empty()
@@ -148,6 +151,12 @@ mod server {
         metadata: Option<Vec<u8>>,
     ) -> Result<(PathBuf, Vec<u8>), CarbonadoError> {
         let object_name = auction_object_name(bundle_id, name)?;
+        if name != AUCTION_CLOSED_NAME {
+            let (marker, _) = auctions_retrieve(bundle_id, AUCTION_CLOSED_NAME).await?;
+            if !marker.is_empty() {
+                return Err(CarbonadoError::AuctionBundleClosed);
+            }
+        }
         let coordinator_key: String = get_coordinator_nostr_key().await;
 
         let level = 15;
@@ -170,6 +179,13 @@ mod server {
         fs::write(&filepath, body.clone()).await?;
         debug!("auction encoded data".to_string());
         Ok((filepath, body))
+    }
+
+    /// Close an auction bundle by writing a Carbonado v2 marker.
+    /// This is a namespace close, not RGB 0.10 `match_highest_price`.
+    pub async fn auctions_close(bundle_id: &str) -> Result<(PathBuf, Vec<u8>), CarbonadoError> {
+        auction_path_segment(bundle_id)?;
+        auctions_store(bundle_id, AUCTION_CLOSED_NAME, b"closed", None).await
     }
 
     pub async fn retrieve(
@@ -370,8 +386,8 @@ mod server {
 
 #[cfg(target_arch = "wasm32")]
 pub use client::{
-    auctions_retrieve, auctions_store, local_store, marketplace_retrieve, marketplace_store,
-    retrieve, retrieve_metadata, store,
+    auctions_close, auctions_retrieve, auctions_store, local_store, marketplace_retrieve,
+    marketplace_store, retrieve, retrieve_metadata, store,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -570,6 +586,34 @@ mod client {
         }
     }
 
+    pub async fn auctions_close(bundle_id: &str) -> Result<(), CarbonadoError> {
+        auction_path_segment(bundle_id)?;
+        let endpoints = BITMASK_ENDPOINT.read().await.to_string();
+        let endpoints: Vec<&str> = endpoints.split(',').collect();
+        let requests = Array::new();
+        let token = crate::constants::get_coordinator_nostr_key().await;
+
+        for endpoint in endpoints {
+            let url = format!("{endpoint}/auction/{bundle_id}/close");
+            let fetch_fn = future_to_promise(fetch_put_close(url, token.clone()));
+            requests.push(&fetch_fn);
+        }
+
+        let results = JsFuture::from(Promise::all_settled(&JsValue::from(requests)))
+            .await
+            .map_err(js_to_error)?;
+
+        info!(format!("Close results: {results:?}"));
+
+        let results = serde_wasm_bindgen::from_value::<Vec<PostStorePromiseResult>>(results)?;
+        let success = results.iter().any(|result| result.value == 200.0);
+        if success {
+            Ok(())
+        } else {
+            Err(CarbonadoError::AllEndpointsFailed)
+        }
+    }
+
     pub async fn retrieve(
         sk: &str,
         name: &str,
@@ -711,6 +755,32 @@ mod client {
             serde_json::from_str(&result.as_string().ok_or(CarbonadoError::ResultNotString)?)?;
 
         Ok(result)
+    }
+
+    async fn fetch_put_close(url: String, token: String) -> Result<JsValue, JsValue> {
+        let request = Request::put(&url)
+            .header("Authorization", &format!("Bearer {token}"))
+            .header("Cache-Control", "no-cache")
+            .build();
+
+        let request = match request {
+            Ok(request) => request,
+            Err(e) => return Err(JsValue::from(e.to_string())),
+        };
+
+        let response = request.send().await;
+
+        match response {
+            Ok(response) => {
+                let status_code = response.status();
+                if status_code == 200 {
+                    Ok(JsValue::from(status_code))
+                } else {
+                    Err(JsValue::from(status_code))
+                }
+            }
+            Err(e) => Err(JsValue::from(e.to_string())),
+        }
     }
 
     async fn fetch_post(url: String, body: Arc<Vec<u8>>) -> Result<JsValue, JsValue> {
